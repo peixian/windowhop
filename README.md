@@ -31,13 +31,18 @@ To try the interface without permissions, choose **Preview Sample Windows** from
 | --- | --- |
 | Cycle windows | Hold **⌘**, press **Tab**, release **⌘** to switch |
 | Cycle backwards | **⌘⇧Tab** |
+| Cycle the frontmost app's windows | **Command + backquote** |
+| Alternate switcher | **Option-Tab**, enable it in Settings |
+| Search while cycling | **⌘S / Option-S**, type, then release the cycling modifier |
 | Search | **Control-Space**, type, then **Return** |
 | Fast Search | Hold **Right Option**, type, then release |
 | Move through results | **↑ / ↓** or **Tab / ⇧Tab** |
 | Switch to one of the first nine results | **⌘1–9** while the panel is open |
+| Close / minimize the selected window | **⌘W / ⌘M** |
+| Hide / quit the selected app | **⌘H / ⌘Q** |
 | Cancel | **Esc** |
 
-Choose **Settings…** from the menu, or press **⌘,** while WindowHop is active, to record your own shortcuts. Each mode can be disabled independently. Fast Search supports left/right Option, Command, Control, or Fn. Settings persist across launches.
+Choose **Settings…** from the menu, or press **⌘,** while WindowHop is active, to record your own shortcuts. Each mode can be disabled independently. Explicitly recorded shortcuts take priority over built-in actions; a reserved number shortcut displays a letter code instead. Fast Search supports left/right Option, Command, Control, or Fn. Settings persist across launches.
 
 ### Letter codes
 
@@ -45,9 +50,21 @@ In Search and Fast Search, windows beyond the first nine show codes such as `e`,
 
 Codes stay attached to windows as the list reorders, and multiple windows from the same app get distinct codes. Automatic codes may change after restarting WindowHop. Custom queries of up to three characters are learned when you select a result; **Forget Learned Searches** clears them.
 
+## Displays, lists, and Sidebar
+
+The switcher appears on **every display by default**, with the same query and selection. Turn off **Settings → General → Show the switcher on every display** to use only the display under your pointer.
+
+**Window Lists** configures the main switcher, alternate switcher, and Sidebar independently: all or visible Spaces, full-screen windows, and whether hidden/minimized windows stay in normal order, move to the bottom, or disappear. Apps without windows can be included. Right-click a result for window actions or **Exclude Application**; restore excluded apps in General.
+
+Enable the optional **Sidebar** for a compact clickable list on each display. It can filter to that display, group by Space, show available Dock badges, and hide until you reach the screen edge. Swipe right or choose **Hide Temporarily** to dismiss it without disabling it.
+
+While searching within a held cycling gesture, letters remain query text; window actions are available before entering search or through the context menu.
+
+An experimental two-finger trackpad-corner gesture is available in General, off by default. Slide down from a top corner and lift to switch. It uses a private macOS touch interface, needs compatible hardware, and requires physical-device validation. Toggle it off/on after connecting a trackpad.
+
 ## Current status
 
-WindowHop is an early implementation of the Contexts keyboard workflow. Spaces and full-screen switching are best effort. Browser-tab search is [researched](docs/BROWSER-TABS.md) but not implemented; sidebar, gestures, and window-management actions are also outside the current feature set.
+Spaces, full-screen discovery, and Dock badges depend on information macOS exposes and remain best effort. Actions request graceful closure or quit, allowing the target app to show save dialogs. Browser-tab search is [researched](docs/BROWSER-TABS.md) but not implemented. See [Contexts feature coverage and platform boundaries](docs/CONTEXTS-PARITY.md).
 
 **Rebuilding can reset Accessibility access** with the default ad-hoc signature. If shortcuts or window discovery stop working after a build, re-enable WindowHop in Accessibility settings. Secure Keyboard Entry can also prevent global shortcut capture.
 
@@ -58,6 +75,8 @@ Everything runs locally. No network service, analytics, or Screen Recording perm
 ```sh
 swift test
 ./scripts/test-keyboard.sh
+./scripts/test-trackpad.sh
+./scripts/test-displays.sh # briefly shows test panels on connected displays
 ./scripts/benchmark-search.sh
 ```
 

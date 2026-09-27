@@ -25,7 +25,10 @@ var actions = [String]()
 keyboard.onAction = { actions.append(String(describing: $0)) }
 func flush() { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.005)) }
 func check(_ value: @autoclosure () -> Bool, _ message: String) {
-    precondition(value(), message)
+    guard value() else {
+        fputs("FAIL: \(message)\n", stderr)
+        exit(1)
+    }
 }
 check(keyboard.synthetic(.keyDown, kVK_Tab, .maskCommand), "Command Tab capture")
 check(keyboard.mode == .cycle, "cycle started")
@@ -276,10 +279,11 @@ directPriority.mode = .search
 directPriority.resultCount = 3
 var priorityActions: [String] = []
 directPriority.onAction = { priorityActions.append(String(describing: $0)) }
-check(directPriority.synthetic(.keyDown, kVK_ANSI_2, .maskCommand), "direct selection precedes configured chord while open")
-_ = directPriority.synthetic(.keyUp, kVK_ANSI_2)
+check(directPriority.synthetic(.keyDown, kVK_ANSI_2, .maskCommand), "configured number chord precedes direct selection while open")
+_ = directPriority.synthetic(.keyUp, kVK_ANSI_2, .maskCommand)
 flush()
-check(priorityActions == ["selectAndCommit(1)"], "open-panel command selects instead of reopening")
+check(priorityActions == ["beginCycle(reverse: false)"], "configured number opens its intended switcher")
+directPriority.mode = .hidden
 check(directPriority.synthetic(.keyDown, kVK_ANSI_2, .maskCommand), "hidden configured number chord still opens cycle")
 directPriority.resultCount = 3
 check(directPriority.synthetic(.keyDown, kVK_ANSI_3, .maskCommand), "cycle supports direct selection")
@@ -343,3 +347,188 @@ for (modifier, aggregate, side, _) in modifierCases {
 }
 flush()
 print("PASS: Cmd1-9 direct selection, bounds/precedence/repeats/buffering/stale-query safety, configured chords, seven Fast Search modifiers, resume safety, Unicode buffering, and 100 search-opening races")
+
+// Additional switchers use independent bindings but preserve hold/release ownership.
+for (key, flags, kind) in [
+    (kVK_ANSI_Grave, CGEventFlags.maskCommand, "App"),
+    (kVK_Tab, CGEventFlags.maskAlternate, "Alternate")
+] {
+    let extra = KeyboardController()
+    extra.configuration.alternateCycleEnabled = true
+    var extraActions: [String] = []
+    extra.onAction = { extraActions.append(String(describing: $0)) }
+    check(extra.synthetic(.keyDown, key, flags), "additional cycle opens")
+    check(extra.synthetic(.keyUp, key, flags), "additional cycle owns keyup")
+    check(extra.synthetic(.keyDown, key, flags.union(.maskShift)), "additional cycle reverses")
+    _ = extra.synthetic(.flagsChanged, kVK_Command)
+    check(extra.mode == .hidden, "additional cycle release commits")
+    check(extra.synthetic(.keyUp, key), "additional cycle keyup survives commit")
+    flush()
+    check(extraActions == ["begin\(kind)Cycle(reverse: false)", "cycle(reverse: true)", "commit"], "additional cycle ordered actions")
+}
+let noExtraCycles = KeyboardController()
+noExtraCycles.configuration.appCycleEnabled = false
+check(!noExtraCycles.synthetic(.keyDown, kVK_ANSI_Grave, .maskCommand), "disabled frontmost-app shortcut remains native")
+check(!noExtraCycles.synthetic(.keyDown, kVK_Tab, .maskAlternate), "alternate shortcut defaults to disabled")
+
+let switchingKinds = KeyboardController()
+switchingKinds.configuration.alternateCycleEnabled = true
+var kindActions: [String] = []
+switchingKinds.onAction = { kindActions.append(String(describing: $0)) }
+_ = switchingKinds.synthetic(.keyDown, kVK_Tab, .maskCommand)
+_ = switchingKinds.synthetic(.keyDown, kVK_ANSI_Grave, .maskCommand)
+_ = switchingKinds.synthetic(.keyDown, kVK_ANSI_Grave, .maskCommand)
+flush()
+check(kindActions == ["beginCycle(reverse: false)", "beginAppCycle(reverse: false)", "cycle(reverse: false)"], "changing cycle bindings starts correct scope")
+
+for (key, action) in [(kVK_ANSI_W, "closeSelected"), (kVK_ANSI_Q, "quitSelectedApp"),
+                       (kVK_ANSI_M, "minimizeSelected"), (kVK_ANSI_H, "hideSelectedApp")] {
+    for nativeSearch in [false, true] {
+        let commands = KeyboardController()
+        if nativeSearch { commands.mode = .search }
+        else { _ = commands.synthetic(.keyDown, kVK_Tab, .maskCommand) }
+        flush()
+        var targetActions: [String] = []
+        commands.onAction = { targetActions.append(String(describing: $0)) }
+        commands.resultCount = 4
+        check(commands.synthetic(.keyDown, key, .maskCommand), "selected action captured")
+        check(commands.resultCount == 0, "selected action invalidates stale numbered results")
+        check(commands.synthetic(.keyDown, key, .maskCommand, repeatKey: true), "destructive action repeat stays captured")
+        check(commands.synthetic(.keyUp, key, .maskCommand), "selected action owns keyup")
+        check(commands.mode == (nativeSearch ? .search : .cycle), "selected action keeps switcher open")
+        flush()
+        check(targetActions == [action], "selected action emits only once")
+        commands.mode = .hidden
+        check(!commands.synthetic(.keyDown, key, .maskCommand), "hidden window action remains native")
+    }
+}
+
+for (hold, trigger) in [(CGEventFlags.maskCommand, CGEventFlags.maskCommand),
+                        (.maskAlternate, .maskAlternate),
+                        (.maskCommand, [.maskCommand, .maskAlternate]),
+                        ([.maskControl, .maskAlternate], [.maskControl, .maskAlternate, .maskCommand])] {
+    let withinCycle = KeyboardController()
+    withinCycle.loadSyntheticLayout()
+    withinCycle.configuration.cycle = KeyboardShortcut(keyCode: UInt16(kVK_Tab), modifiers: ShortcutModifiers(rawValue: hold.rawValue))
+    var searchActions: [String] = []
+    withinCycle.onAction = { searchActions.append(String(describing: $0)) }
+    _ = withinCycle.synthetic(.keyDown, kVK_Tab, hold)
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_S, trigger), "cycle search trigger captured")
+    check(withinCycle.mode == .cycleSearch, "cycle search preserves held mode")
+    check(withinCycle.synthetic(.keyUp, kVK_ANSI_S, trigger), "cycle search trigger owns keyup")
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_W, hold), "query w captured as text")
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_Q, hold), "query q captured as text")
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_M, hold), "query m captured as text")
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_H, hold), "query h captured as text")
+    check(withinCycle.synthetic(.keyDown, kVK_ANSI_J, hold), "query j captured as text")
+    check(withinCycle.synthetic(.keyDown, kVK_Delete, hold), "cycle search supports deletion")
+    check(withinCycle.synthetic(.keyDown, kVK_DownArrow, hold.union(.maskSecondaryFn)), "cycle search supports navigation")
+    _ = withinCycle.synthetic(.flagsChanged, kVK_Command)
+    check(withinCycle.mode == .hidden, "original cycle modifier release commits search")
+    check(withinCycle.synthetic(.keyUp, kVK_ANSI_W), "cycle search retains query keyup ownership")
+    flush()
+    check(searchActions == ["beginCycle(reverse: false)", "beginCycleSearch", "appendText(\"w\")", "appendText(\"q\")", "appendText(\"m\")", "appendText(\"h\")", "appendText(\"j\")", "deleteBackward", "move(1)", "commit"], "cycle search emits ordered text, never selected-window commands")
+}
+
+let cycleSearchNumber = KeyboardController()
+cycleSearchNumber.loadSyntheticLayout()
+_ = cycleSearchNumber.synthetic(.keyDown, kVK_Tab, .maskCommand)
+_ = cycleSearchNumber.synthetic(.keyDown, kVK_ANSI_S, .maskCommand)
+cycleSearchNumber.resultCount = 3
+check(cycleSearchNumber.synthetic(.keyDown, kVK_ANSI_2, .maskCommand), "cycle search numbered selection works")
+check(cycleSearchNumber.mode == .hidden, "cycle search numbered selection commits")
+
+let commandFastText = KeyboardController()
+commandFastText.configuration.fastSearchModifier = .rightCommand
+commandFastText.loadSyntheticLayout()
+_ = commandFastText.synthetic(.flagsChanged, kVK_Command)
+var plainActions: [String] = []
+commandFastText.onAction = { plainActions.append(String(describing: $0)) }
+_ = commandFastText.synthetic(.keyDown, kVK_ANSI_W, rightCommand)
+_ = commandFastText.synthetic(.keyDown, kVK_ANSI_Q, rightCommand)
+flush()
+check(plainActions == ["beginFastSearch(\"w\")", "appendText(\"q\")"], "Command Fast Search keeps destructive letters as query text")
+
+let cycleNavigation = KeyboardController()
+var navigationActions: [String] = []
+cycleNavigation.onAction = { navigationActions.append(String(describing: $0)) }
+_ = cycleNavigation.synthetic(.keyDown, kVK_Tab, .maskCommand)
+for key in [kVK_ANSI_P, kVK_ANSI_K, kVK_ANSI_N, kVK_ANSI_J] {
+    check(cycleNavigation.synthetic(.keyDown, key, .maskCommand), "cycle navigation alias captured")
+    check(cycleNavigation.synthetic(.keyUp, key, .maskCommand), "cycle navigation alias owns keyup")
+}
+flush()
+check(navigationActions == ["beginCycle(reverse: false)", "move(-1)", "move(-1)", "move(1)", "move(1)"], "cycle navigation aliases preserve order")
+print("PASS: independent frontmost/alternate switchers, cycle-to-search hold/release, selected actions, action repeat/key-up safety, navigation aliases, and Command-modifier query safety")
+
+for key in [kVK_ANSI_W, kVK_ANSI_Q, kVK_ANSI_M, kVK_ANSI_H] {
+    let reservedByUser = KeyboardController()
+    reservedByUser.configuration.cycle = KeyboardShortcut(keyCode: UInt16(key), modifiers: .command)
+    var reservedActions: [String] = []
+    reservedByUser.onAction = { reservedActions.append(String(describing: $0)) }
+    _ = reservedByUser.synthetic(.keyDown, key, .maskCommand)
+    _ = reservedByUser.synthetic(.keyUp, key, .maskCommand)
+    _ = reservedByUser.synthetic(.keyDown, key, .maskCommand)
+    flush()
+    check(reservedActions == ["beginCycle(reverse: false)", "cycle(reverse: false)"], "explicit user cycle wins over selected-window action")
+}
+print("PASS: configured action-letter cycle bindings cannot invoke destructive selected-item actions")
+
+for searchInCycle in [false, true] {
+    let cancelledOption = KeyboardController()
+    cancelledOption.configuration.alternateCycleEnabled = true
+    cancelledOption.loadSyntheticLayout()
+    _ = cancelledOption.synthetic(.flagsChanged, kVK_RightOption)
+    _ = cancelledOption.synthetic(.keyDown, kVK_Tab, rightOption)
+    if searchInCycle { _ = cancelledOption.synthetic(.keyDown, kVK_ANSI_S, rightOption) }
+    check(cancelledOption.synthetic(.keyDown, kVK_Escape, rightOption), "Escape cancels held Option cycle")
+    check(cancelledOption.mode == .hidden, "cancelled Option cycle is hidden")
+    check(!cancelledOption.synthetic(.keyDown, kVK_ANSI_A, rightOption), "held Option cannot reopen Fast Search after cycle cancellation")
+    check(cancelledOption.mode == .hidden, "Fast Search remains disarmed until Option release")
+    check(cancelledOption.synthetic(.keyUp, kVK_Escape, rightOption), "cancelled Option cycle owns Escape keyup")
+    _ = cancelledOption.synthetic(.flagsChanged, kVK_RightOption)
+    check(cancelledOption.synthetic(.keyDown, kVK_ANSI_A, rightOption), "fresh Option gesture can search after release")
+    check(cancelledOption.mode == .fastSearch, "Fast Search rearms on a fresh modifier gesture")
+}
+print("PASS: cancelling Option cycle or cycle-search cannot reopen Fast Search until modifier release")
+
+// Saved bindings must never turn into generic in-panel commands after opening.
+for key in [kVK_ANSI_S, kVK_ANSI_N, kVK_ANSI_P, kVK_ANSI_J, kVK_ANSI_K] + numberKeys {
+    let configuredSearch = KeyboardController()
+    configuredSearch.configuration.search = KeyboardShortcut(keyCode: UInt16(key), modifiers: .command)
+    var configuredActions: [String] = []
+    configuredSearch.onAction = { configuredActions.append(String(describing: $0)) }
+    _ = configuredSearch.synthetic(.keyDown, kVK_Tab, .maskCommand)
+    configuredSearch.resultCount = 9
+    check(configuredSearch.synthetic(.keyDown, key, .maskCommand), "configured search chord captured during cycle")
+    check(configuredSearch.mode == .search, "configured search wins over generic search/navigation/number")
+    check(configuredSearch.synthetic(.keyUp, key, .maskCommand), "configured search owns keyup")
+    configuredSearch.syntheticSearchReady { _ in preconditionFailure("No native field events expected") }
+    configuredSearch.resultCount = 9
+    check(configuredSearch.synthetic(.keyDown, key, .maskCommand), "configured search remains reserved in native search")
+    flush()
+    check(configuredActions == ["beginCycle(reverse: false)", "showSearch"], "configured search never selects or navigates by accident")
+}
+for key in numberKeys {
+    let configuredCycle = KeyboardController()
+    configuredCycle.configuration.cycle = KeyboardShortcut(keyCode: UInt16(key), modifiers: .command)
+    var configuredActions: [String] = []
+    configuredCycle.onAction = { configuredActions.append(String(describing: $0)) }
+    _ = configuredCycle.synthetic(.keyDown, key, .maskCommand)
+    configuredCycle.resultCount = 9
+    _ = configuredCycle.synthetic(.keyDown, key, .maskCommand)
+    check(configuredCycle.mode == .cycle, "configured numeric cycle never commits a numbered row")
+    flush()
+    check(configuredActions == ["beginCycle(reverse: false)", "cycle(reverse: false)"], "configured numeric cycle repeats normally")
+}
+let configuredDuringQuery = KeyboardController()
+configuredDuringQuery.configuration.search = KeyboardShortcut(keyCode: UInt16(kVK_ANSI_2), modifiers: .command)
+var queryBindingActions: [String] = []
+configuredDuringQuery.onAction = { queryBindingActions.append(String(describing: $0)) }
+_ = configuredDuringQuery.synthetic(.keyDown, kVK_Tab, .maskCommand)
+_ = configuredDuringQuery.synthetic(.keyDown, kVK_ANSI_S, .maskCommand)
+configuredDuringQuery.resultCount = 9
+_ = configuredDuringQuery.synthetic(.keyDown, kVK_ANSI_2, .maskCommand)
+flush()
+check(queryBindingActions == ["beginCycle(reverse: false)", "beginCycleSearch", "showSearch"], "explicit binding retains priority within held-modifier cycle search")
+print("PASS: enabled configured chords precede all generic selected actions, navigation, cycle-search, and Cmd1-9 commands")

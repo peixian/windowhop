@@ -69,8 +69,12 @@ public enum FastSearchModifier: String, Codable, CaseIterable {
 public struct ShortcutConfiguration: Codable, Equatable {
     public var cycle: KeyboardShortcut
     public var search: KeyboardShortcut
+    public var appCycle: KeyboardShortcut
+    public var alternateCycle: KeyboardShortcut
     public var cycleEnabled: Bool
     public var searchEnabled: Bool
+    public var appCycleEnabled: Bool
+    public var alternateCycleEnabled: Bool
     public var fastSearchEnabled: Bool
     public var fastSearchModifier: FastSearchModifier
 
@@ -82,7 +86,11 @@ public struct ShortcutConfiguration: Codable, Equatable {
         cycleEnabled: Bool = true,
         searchEnabled: Bool = true,
         fastSearchEnabled: Bool = true,
-        fastSearchModifier: FastSearchModifier = .rightOption
+        fastSearchModifier: FastSearchModifier = .rightOption,
+        appCycle: KeyboardShortcut = KeyboardShortcut(keyCode: 50, modifiers: .command),
+        alternateCycle: KeyboardShortcut = KeyboardShortcut(keyCode: 48, modifiers: .option),
+        appCycleEnabled: Bool = true,
+        alternateCycleEnabled: Bool = false
     ) {
         self.cycle = cycle
         self.search = search
@@ -90,28 +98,67 @@ public struct ShortcutConfiguration: Codable, Equatable {
         self.searchEnabled = searchEnabled
         self.fastSearchEnabled = fastSearchEnabled
         self.fastSearchModifier = fastSearchModifier
+        self.appCycle = appCycle
+        self.alternateCycle = alternateCycle
+        self.appCycleEnabled = appCycleEnabled
+        self.alternateCycleEnabled = alternateCycleEnabled
     }
 
-    /// Disabled bindings may keep their saved chords without blocking another
-    /// binding. Cycle's Shift variant belongs to reverse cycling. Fast Search
-    /// yields to explicit chords, so its modifier may also occur in either chord.
+    private enum CodingKeys: String, CodingKey {
+        case cycle, search, appCycle, alternateCycle
+        case cycleEnabled, searchEnabled, appCycleEnabled, alternateCycleEnabled
+        case fastSearchEnabled, fastSearchModifier
+    }
+
+    /// Settings saved before additional switchers existed retain their original
+    /// bindings. Missing new fields inherit defaults instead of losing all settings.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = Self.defaults
+        cycle = try values.decodeIfPresent(KeyboardShortcut.self, forKey: .cycle) ?? fallback.cycle
+        search = try values.decodeIfPresent(KeyboardShortcut.self, forKey: .search) ?? fallback.search
+        appCycle = try values.decodeIfPresent(KeyboardShortcut.self, forKey: .appCycle) ?? fallback.appCycle
+        alternateCycle = try values.decodeIfPresent(KeyboardShortcut.self, forKey: .alternateCycle) ?? fallback.alternateCycle
+        cycleEnabled = try values.decodeIfPresent(Bool.self, forKey: .cycleEnabled) ?? fallback.cycleEnabled
+        searchEnabled = try values.decodeIfPresent(Bool.self, forKey: .searchEnabled) ?? fallback.searchEnabled
+        appCycleEnabled = try values.decodeIfPresent(Bool.self, forKey: .appCycleEnabled) ?? fallback.appCycleEnabled
+        alternateCycleEnabled = try values.decodeIfPresent(Bool.self, forKey: .alternateCycleEnabled) ?? fallback.alternateCycleEnabled
+        fastSearchEnabled = try values.decodeIfPresent(Bool.self, forKey: .fastSearchEnabled) ?? fallback.fastSearchEnabled
+        fastSearchModifier = try values.decodeIfPresent(FastSearchModifier.self, forKey: .fastSearchModifier) ?? fallback.fastSearchModifier
+        // Do not invalidate a preexisting custom shortcut by enabling a new
+        // default binding that claims the same chord during migration.
+        if !values.contains(.appCycleEnabled) {
+            let candidates = [appCycle, KeyboardShortcut(keyCode: appCycle.keyCode, modifiers: appCycle.modifiers.union(.shift))]
+            let existing = (cycleEnabled ? [cycle, KeyboardShortcut(keyCode: cycle.keyCode, modifiers: cycle.modifiers.union(.shift))] : []) + (searchEnabled ? [search] : [])
+            if candidates.contains(where: existing.contains) { appCycleEnabled = false }
+        }
+    }
+
+    /// Disabled bindings do not reserve a chord. Every cycle binding reserves
+    /// its Shift variant for reverse cycling. Fast Search yields to explicit chords.
     public func validationError() -> String? {
-        if cycleEnabled {
-            if let error = Self.validate(cycle, name: "Window cycling") { return error }
-            if cycle.modifiers.contains(.shift) {
-                return "Window cycling reserves Shift for switching in reverse. Choose a shortcut without Shift."
+        let bindings: [(String, KeyboardShortcut, Bool, Bool)] = [
+            ("Window cycling", cycle, cycleEnabled, true),
+            ("Frontmost-app cycling", appCycle, appCycleEnabled, true),
+            ("Alternate cycling", alternateCycle, alternateCycleEnabled, true),
+            ("Window search", search, searchEnabled, false)
+        ]
+        var reserved: [(String, KeyboardShortcut)] = []
+        for (name, shortcut, enabled, isCycle) in bindings where enabled {
+            if let error = Self.validate(shortcut, name: name) { return error }
+            if isCycle && shortcut.modifiers.contains(.shift) {
+                return "\(name) reserves Shift for switching in reverse. Choose a shortcut without Shift."
             }
-        }
-        if searchEnabled {
-            if let error = Self.validate(search, name: "Window search") { return error }
-        }
-        if cycleEnabled && searchEnabled && cycle.keyCode == search.keyCode {
-            if cycle.modifiers == search.modifiers {
-                return "Window cycling and window search need different shortcuts."
+            var chords = [shortcut]
+            if isCycle {
+                chords.append(KeyboardShortcut(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers.union(.shift)))
             }
-            if cycle.modifiers.union(.shift) == search.modifiers {
-                return "That search shortcut is already used for reverse window cycling."
+            for chord in chords {
+                if let conflict = reserved.first(where: { $0.1 == chord }) {
+                    return "\(name) conflicts with \(conflict.0.lowercased()). Choose different shortcuts, including their Shift variants."
+                }
             }
+            reserved.append(contentsOf: chords.map { (name, $0) })
         }
         return nil
     }

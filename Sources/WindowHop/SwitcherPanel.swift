@@ -6,6 +6,18 @@ private final class FloatingPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+private final class ResultsTable: NSTableView {
+    // Keyboard navigation belongs to the switcher; typing always stays in search.
+    override var acceptsFirstResponder: Bool { false }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let clicked = row(at: convert(event.locationInWindow, from: nil))
+        guard clicked >= 0 else { return nil }
+        selectRowIndexes(IndexSet(integer: clicked), byExtendingSelection: false)
+        return super.menu(for: event)
+    }
+}
+
 private final class PanelSurface: NSView {
     override var wantsUpdateLayer: Bool { true }
 
@@ -77,6 +89,7 @@ private final class WindowRow: NSTableCellView {
     let appName = NSTextField(labelWithString: "")
     let appIcon = NSImageView()
     let windowTitle = NSTextField(labelWithString: "")
+    private let badge = NSTextField(labelWithString: "")
     private(set) var bundleIdentifier = ""
 
     override init(frame frameRect: NSRect) {
@@ -93,6 +106,14 @@ private final class WindowRow: NSTableCellView {
         windowTitle.lineBreakMode = .byTruncatingMiddle
         appIcon.imageScaling = .scaleProportionallyDown
         addSubview(appIcon)
+        badge.font = .systemFont(ofSize: 8, weight: .bold)
+        badge.alignment = .center
+        badge.textColor = .white
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 6
+        badge.layer?.masksToBounds = true
+        badge.isHidden = true
+        addSubview(badge)
         textField = windowTitle
         imageView = appIcon
         updateColors()
@@ -111,11 +132,13 @@ private final class WindowRow: NSTableCellView {
         hint.frame = NSRect(x: 18, y: labelY, width: 26, height: 17)
         appName.frame = NSRect(x: 48, y: labelY, width: appWidth, height: 17)
         appIcon.frame = NSRect(x: appName.frame.maxX + 10, y: (bounds.height - 19) / 2, width: 19, height: 19)
+        let badgeWidth: CGFloat = badge.stringValue.count > 2 ? 20 : (badge.stringValue.count > 1 ? 15 : 12)
+        badge.frame = NSRect(x: appIcon.frame.maxX + 4 - badgeWidth, y: appIcon.frame.maxY - 10, width: badgeWidth, height: 12)
         let titleX = appIcon.frame.maxX + 9
         windowTitle.frame = NSRect(x: titleX, y: labelY, width: max(0, bounds.width - titleX - 12), height: 17)
     }
 
-    func configure(_ item: WindowItem, hint shortcut: String, quickNumber: Int?, icon: NSImage?) {
+    func configure(_ item: WindowItem, hint shortcut: String, quickNumber: Int?, icon: NSImage?, showsBadge: Bool) {
         bundleIdentifier = item.bundleIdentifier
         hint.stringValue = quickNumber.map { "⌘\($0)" } ?? shortcut
         hint.toolTip = quickNumber.map { "Command-\($0) switches to this result" }
@@ -124,17 +147,62 @@ private final class WindowRow: NSTableCellView {
         }
         appName.stringValue = item.appName
         appIcon.image = icon
+        let badgeText = showsBadge ? item.badge : nil
+        badge.stringValue = badgeText.map { $0.count > 3 ? "•" : $0 } ?? ""
+        badge.isHidden = badgeText?.isEmpty ?? true
+        badge.setAccessibilityLabel(badgeText.map { "Badge: \($0)" })
+        needsLayout = true
         windowTitle.stringValue = item.title.isEmpty ? item.appName : item.title
-        let state = item.isMinimized ? ", minimized" : (item.isHidden ? ", hidden" : "")
+        var state = item.isMinimized ? ", minimized" : (item.isHidden ? ", hidden" : "")
+        if item.isApplicationOnly { state += ", application with no open windows" }
+        if let badgeText, !badgeText.isEmpty { state += ", badge \(badgeText)" }
         toolTip = "\(item.appName): \(windowTitle.stringValue)\(state)"
         setAccessibilityLabel("\(item.appName), \(windowTitle.stringValue)\(state)")
     }
 
     private func updateColors() {
         let selected = backgroundStyle == .emphasized
+        badge.layer?.backgroundColor = NSColor.systemRed.cgColor
         appName.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
         windowTitle.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
         hint.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+    }
+}
+
+/// Shared by display replicas, so a display never repeats application/icon I/O.
+final class SwitcherIconCache {
+    private var icons: [String: NSImage] = [:]
+    private var requested = Set<String>()
+    private var observers: [UUID: () -> Void] = [:]
+    private let queue = DispatchQueue(label: "WindowHop.icons", qos: .userInitiated)
+    private let fallback = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
+
+    func icon(for bundleIdentifier: String) -> NSImage? { icons[bundleIdentifier] ?? fallback }
+    func observe(_ callback: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        observers[id] = callback
+        return id
+    }
+    func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
+
+    func prepare(windows: [WindowItem]) {
+        let needed = Set(windows.map(\.bundleIdentifier)).filter { !$0.isEmpty && !requested.contains($0) }
+        requested.formUnion(needed)
+        guard !needed.isEmpty else { return }
+        queue.async { [weak self] in
+            var loaded: [String: NSImage] = [:]
+            for identifier in needed {
+                if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+                    loaded[identifier] = NSWorkspace.shared.icon(forFile: url.path)
+                }
+            }
+            let resolved = loaded
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.icons.merge(resolved) { _, new in new }
+                for observer in self.observers.values { observer() }
+            }
+        }
     }
 }
 
@@ -147,12 +215,30 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     var onCancel: (() -> Void)?
     var onSelection: ((Int) -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onCloseSelected: (() -> Void)?
+    var onMinimizeSelected: (() -> Void)?
+    var onHideSelectedApp: (() -> Void)?
+    var onQuitSelectedApp: (() -> Void)?
+    var onExcludeApplication: ((WindowItem) -> Void)?
+    var onResignKey: (() -> Void)?
+    var onBecomeKey: (() -> Void)?
+    var showsBadges = true {
+        didSet { if showsBadges != oldValue { updateVisibleCells() } }
+    }
+    var reservedCommandKeyCodes: Set<UInt16> = [] {
+        didSet {
+            if reservedCommandKeyCodes != oldValue {
+                updateVisibleCells()
+                updateActionMenuShortcuts()
+            }
+        }
+    }
 
     private let panel: FloatingPanel
     private let search = NSTextField()
     private let heading = NSTextField(labelWithString: "Switch windows")
     private let group = NSTextField(labelWithString: "All")
-    private let table = NSTableView()
+    private let table = ResultsTable()
     private let scroll = NSScrollView()
     private let footer = NSTextField(labelWithString: "")
     private let empty = NSTextField(wrappingLabelWithString: "")
@@ -167,19 +253,21 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     private var preparedWindowCount = 0
     private var lastRowCount = -1
     private var lastPermissionState = false
-    private var icons: [String: NSImage] = [:]
-    private var requestedIcons = Set<String>()
+    private let iconCache: SwitcherIconCache
+    private var iconObserver: UUID?
     private var shortcutHints: [String: String] = [:]
     private var renderedMode: SwitcherSession.Mode?
-    private let iconQueue = DispatchQueue(label: "WindowHop.icons", qos: .userInitiated)
-    private let fallbackIcon = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
-    private static let quickSelectionKeys: [UInt16: Int] = [18: 0, 19: 1, 20: 2, 21: 3, 23: 4, 22: 5, 26: 6, 28: 7, 25: 8]
+    private static let quickSelectionKeyCodes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25]
+    private static let quickSelectionKeys = Dictionary(uniqueKeysWithValues: quickSelectionKeyCodes.enumerated().map { ($0.element, $0.offset) })
     var isVisible: Bool { panel.isVisible }
+    var isKeyWindow: Bool { panel.isKeyWindow }
 
-    override init() {
+    init(iconCache: SwitcherIconCache = SwitcherIconCache()) {
+        self.iconCache = iconCache
         panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 760, height: 300),
                               styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
+        iconObserver = iconCache.observe { [weak self] in self?.updateVisibleCells() }
         panel.title = "WindowHop"
         panel.delegate = self
         panel.level = .popUpMenu
@@ -238,6 +326,22 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         table.target = self
         table.doubleAction = #selector(doubleClick)
         table.setAccessibilityLabel("Windows")
+        let rowMenu = NSMenu()
+        for (title, action, key) in [
+            ("Close Window", #selector(closeSelected), "w"),
+            ("Minimize Window", #selector(minimizeSelected), "m"),
+            ("Hide Application", #selector(hideSelectedApp), "h"),
+            ("Quit Application", #selector(quitSelectedApp), "q")
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.target = self
+            rowMenu.addItem(item)
+        }
+        rowMenu.addItem(.separator())
+        let exclude = NSMenuItem(title: "Exclude Application from WindowHop", action: #selector(excludeSelectedApp), keyEquivalent: "")
+        exclude.target = self
+        rowMenu.addItem(exclude)
+        table.menu = rowMenu
         scroll.documentView = table
         // The compact keyboard-first list needs scrolling, not a permanent
         // scrollbar gutter (including when macOS is set to always show them).
@@ -281,12 +385,31 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             permissionButton.topAnchor.constraint(equalTo: empty.bottomAnchor, constant: 12)
         ])
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self, self.isVisible else { return event }
+            guard let self, self.isVisible, self.panel.isKeyWindow,
+                  event.window == nil || event.window === self.panel else { return event }
+            // An explicitly recorded binding belongs to the keyboard engine,
+            // even when its key would normally select a result or close a window.
+            if ShortcutModifiers(rawValue: UInt64(event.modifierFlags.rawValue)) == .command,
+               self.reservedCommandKeyCodes.contains(event.keyCode) { return event }
             if let editor = self.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
             if ShortcutModifiers(rawValue: UInt64(event.modifierFlags.rawValue)) == .command,
                let index = Self.quickSelectionKeys[event.keyCode] {
                 if !event.isARepeat, self.rows.indices.contains(index) { self.onQuickSelect?(index) }
                 return nil
+            }
+            if ShortcutModifiers(rawValue: UInt64(event.modifierFlags.rawValue)) == .command {
+                let action: (() -> Void)?
+                switch event.keyCode {
+                case 13: action = self.onCloseSelected
+                case 46: action = self.onMinimizeSelected
+                case 4: action = self.onHideSelectedApp
+                case 12: action = self.onQuitSelectedApp
+                default: action = nil
+                }
+                if let action {
+                    if !event.isARepeat { action() }
+                    return nil
+                }
             }
             if event.modifierFlags.contains(.command), NSApp.mainMenu?.performKeyEquivalent(with: event) == true { return nil }
             switch event.keyCode {
@@ -302,55 +425,51 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
 
     deinit {
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let iconObserver { iconCache.removeObserver(iconObserver) }
     }
 
     /// Warm app metadata outside the typing/cycling path. Icon results update
     /// visible cells in place without rebuilding or reordering the list.
     func prepare(windows: [WindowItem]) {
         preparedWindowCount = windows.count
-        let needed = Set(windows.map(\.bundleIdentifier)).filter { !$0.isEmpty && !requestedIcons.contains($0) }
-        requestedIcons.formUnion(needed)
-        guard !needed.isEmpty else { return }
-        iconQueue.async { [weak self] in
-            var loaded: [String: NSImage] = [:]
-            for identifier in needed {
-                if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
-                    loaded[identifier] = NSWorkspace.shared.icon(forFile: url.path)
-                }
-            }
-            let resolvedIcons = loaded
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.icons.merge(resolvedIcons) { _, new in new }
-                self.updateVisibleCells()
-            }
-        }
+        iconCache.prepare(windows: windows)
     }
 
-    func show(mode: SwitcherSession.Mode, screen: NSScreen?, demo: Bool) {
+    func show(mode: SwitcherSession.Mode, screen: NSScreen?, demo: Bool, takesKeyboardFocus: Bool = true) {
         self.mode = mode
-        let target = screen ?? NSScreen.main ?? NSScreen.screens.first
-        displayBounds = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 800)
-        let openingHeight = desiredHeight(rowCount: preparedWindowCount, needsPermission: false)
-        topEdge = min(displayBounds.maxY - 20, displayBounds.midY + openingHeight / 2 + 25)
-        lastRowCount = -1
-        fitPanel(rowCount: preparedWindowCount, needsPermission: false)
+        position(on: screen, rowCount: preparedWindowCount, needsPermission: false)
         search.isHidden = mode != .search
         heading.isHidden = mode == .search
         search.stringValue = ""
-        if mode == .search {
-            panel.makeKeyAndOrderFront(nil)
-            panel.makeFirstResponder(search)
-            if let editor = panel.fieldEditor(false, for: search) as? NSTextView {
-                editor.isAutomaticQuoteSubstitutionEnabled = false
-                editor.isAutomaticDashSubstitutionEnabled = false
-                editor.isAutomaticSpellingCorrectionEnabled = false
-                editor.isAutomaticTextReplacementEnabled = false
-            }
-        } else {
-            panel.orderFrontRegardless()
-        }
         footer.stringValue = demo ? "Demo windows" : ""
+        if mode == .search, takesKeyboardFocus { focusSearch() }
+        else { panel.orderFrontRegardless() }
+    }
+
+    /// Display changes reposition an existing session without clearing its input.
+    func position(on screen: NSScreen?, rowCount: Int, needsPermission: Bool) {
+        let target = screen ?? NSScreen.main ?? NSScreen.screens.first
+        displayBounds = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 800)
+        let openingHeight = desiredHeight(rowCount: rowCount, needsPermission: needsPermission)
+        topEdge = min(displayBounds.maxY - 20, displayBounds.midY + openingHeight / 2 + 25)
+        lastRowCount = -1
+        fitPanel(rowCount: rowCount, needsPermission: needsPermission)
+    }
+
+    func focusSearch() {
+        guard mode == .search else { return }
+        panel.makeKeyAndOrderFront(nil)
+        prepareSearchEditor()
+    }
+
+    private func prepareSearchEditor() {
+        panel.makeFirstResponder(search)
+        if let editor = panel.fieldEditor(false, for: search) as? NSTextView {
+            editor.isAutomaticQuoteSubstitutionEnabled = false
+            editor.isAutomaticDashSubstitutionEnabled = false
+            editor.isAutomaticSpellingCorrectionEnabled = false
+            editor.isAutomaticTextReplacementEnabled = false
+        }
     }
 
     func render(_ session: SwitcherSession, footer text: String, emptyMessage: String, needsPermission: Bool = false) {
@@ -359,6 +478,9 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         shortcutHints = session.searchShortcuts
         renderedMode = session.mode
         if changed { rows = session.results }
+        // The key panel owns the field editor (including IME composition).
+        // Other displays mirror committed query state without an input caret.
+        if !panel.isKeyWindow, search.stringValue != session.query { search.stringValue = session.query }
         heading.stringValue = session.query.isEmpty ? "Switch windows" : session.query
         group.stringValue = session.query.isEmpty ? "All" : "Matches"
         footer.stringValue = text
@@ -388,7 +510,13 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        if !suppressResign, panel.isVisible, mode == .search { onCancel?() }
+        guard !suppressResign, panel.isVisible, mode == .search else { return }
+        if let onResignKey { onResignKey() } else { onCancel?() }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        onBecomeKey?()
+        if mode == .search { prepareSearchEditor() }
     }
 
     private func desiredHeight(rowCount: Int, needsPermission: Bool) -> CGFloat {
@@ -406,6 +534,20 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         if panel.frame != frame { panel.setFrame(frame, display: panel.isVisible) }
     }
 
+    private func updateActionMenuShortcuts() {
+        for item in table.menu?.items ?? [] {
+            let shortcut: (UInt16, String)
+            switch item.action {
+            case #selector(closeSelected): shortcut = (13, "w")
+            case #selector(minimizeSelected): shortcut = (46, "m")
+            case #selector(hideSelectedApp): shortcut = (4, "h")
+            case #selector(quitSelectedApp): shortcut = (12, "q")
+            default: continue
+            }
+            item.keyEquivalent = reservedCommandKeyCodes.contains(shortcut.0) ? "" : shortcut.1
+        }
+    }
+
     private func updateVisibleCells() {
         let visible = table.rows(in: table.visibleRect)
         guard visible.location != NSNotFound, visible.length > 0 else { return }
@@ -417,7 +559,8 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     private func configure(_ view: WindowRow, row: Int) {
         let item = rows[row]
         let hint = mode == .cycle ? "" : (shortcutHints[item.id] ?? "")
-        view.configure(item, hint: hint, quickNumber: row < 9 ? row + 1 : nil, icon: icons[item.bundleIdentifier] ?? fallbackIcon)
+        let quickNumber = row < Self.quickSelectionKeyCodes.count && !reservedCommandKeyCodes.contains(Self.quickSelectionKeyCodes[row]) ? row + 1 : nil
+        view.configure(item, hint: hint, quickNumber: quickNumber, icon: iconCache.icon(for: item.bundleIdentifier), showsBadge: showsBadges)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -439,4 +582,12 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     func controlTextDidChange(_ obj: Notification) { onQuery?(search.stringValue) }
     @objc private func doubleClick() { if table.clickedRow >= 0 { onCommit?() } }
     @objc private func openSettings() { onOpenSettings?() }
+    @objc private func closeSelected() { onCloseSelected?() }
+    @objc private func minimizeSelected() { onMinimizeSelected?() }
+    @objc private func hideSelectedApp() { onHideSelectedApp?() }
+    @objc private func quitSelectedApp() { onQuitSelectedApp?() }
+    @objc private func excludeSelectedApp() {
+        guard rows.indices.contains(table.selectedRow) else { return }
+        onExcludeApplication?(rows[table.selectedRow])
+    }
 }

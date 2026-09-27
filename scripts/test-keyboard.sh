@@ -10,7 +10,7 @@ trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
 cat "$repo_root/Sources/WindowHop/KeyboardController.swift" \
     "$repo_root/Tests/KeyboardHarness.swift" > "$test_dir/main.swift"
 swiftc -O -emit-library -emit-module -module-name WindowHopCore \
-    "$repo_root"/Sources/WindowHopCore/*.swift \
+    "$repo_root/Sources/WindowHopCore/ShortcutConfiguration.swift" \
     -emit-module-path "$test_dir/WindowHopCore.swiftmodule" \
     -o "$test_dir/libWindowHopCore.dylib"
 swiftc -O -I "$test_dir" -L "$test_dir" -lWindowHopCore \

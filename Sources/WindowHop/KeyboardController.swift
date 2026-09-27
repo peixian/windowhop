@@ -4,6 +4,13 @@ import WindowHopCore
 
 enum KeyboardAction {
     case beginCycle(reverse: Bool)
+    case beginAppCycle(reverse: Bool)
+    case beginAlternateCycle(reverse: Bool)
+    case beginCycleSearch
+    case closeSelected
+    case quitSelectedApp
+    case minimizeSelected
+    case hideSelectedApp
     case cycle(reverse: Bool)
     case showSearch
     case beginFastSearch(String)
@@ -18,7 +25,8 @@ enum KeyboardAction {
 /// The tap runs on the main run loop. Its callback only updates local state;
 /// UI actions are delivered in order after the callback returns.
 final class KeyboardController {
-    enum Mode { case hidden, cycle, search, fastSearch }
+    enum Mode { case hidden, cycle, cycleSearch, search, fastSearch }
+    private enum CycleKind { case primary, app, alternate }
 
     var onAction: ((KeyboardAction) -> Void)?
     var onFailure: ((String) -> Void)?
@@ -46,7 +54,11 @@ final class KeyboardController {
         didSet {
             searchSession += 1
             resultCount = 0
-            if mode != .cycle { cycleHoldModifiers = 0 }
+            if mode != .cycle && mode != .cycleSearch {
+                cycleHoldModifiers = 0
+                activeCycle = nil
+                cycleSearchExtraModifiers = 0
+            }
             if mode != .search {
                 preparingSearch = false
                 pendingSearchEvents.removeAll()
@@ -55,7 +67,7 @@ final class KeyboardController {
             }
             if mode == .hidden {
                 deadKeyState = 0
-                if oldValue == .fastSearch, fastModifierHeld {
+                if oldValue == .fastSearch || oldValue == .cycleSearch || oldValue == .cycle, fastModifierHeld {
                     suppressFastSearchUntilRelease = true
                 }
             }
@@ -68,6 +80,8 @@ final class KeyboardController {
 
     private var configurationIsValid = true
     private var cycleHoldModifiers: UInt64 = 0
+    private var cycleSearchExtraModifiers: UInt64 = 0
+    private var activeCycle: CycleKind?
     private static let chordModifierMask: UInt64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 23)
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -196,7 +210,10 @@ final class KeyboardController {
         fastModifierHeld = isFastModifierHeld(flags)
         if !fastModifierHeld { suppressFastSearchUntilRelease = false }
         // Reconcile on every event in case macOS omitted a modifier transition.
-        if mode == .cycle, flags.rawValue & cycleHoldModifiers != cycleHoldModifiers { finish(.commit) }
+        if mode == .cycle || mode == .cycleSearch {
+            if flags.rawValue & cycleHoldModifiers != cycleHoldModifiers { finish(.commit) }
+        }
+        if mode == .cycleSearch, !cycleSearchFlagsAllowed(flags, key: key) { finish(.cancel) }
         if mode == .fastSearch {
             if !fastModifierHeld { finish(.commit) }
             else if !fastSearchFlagsAllowed(flags, key: key), !quickSelectionModifiersAllowed(flags) { finish(.cancel) }
@@ -230,29 +247,21 @@ final class KeyboardController {
 
         let reversed = flags.contains(.maskShift)
 
-        if mode != .hidden, let index = directSelectionIndex(key: key, flags: flags) {
-            if mode == .search, !preparingSearch,
-               let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.hasMarkedText() {
-                return Unmanaged.passUnretained(event)
-            }
-            if mode == .search, preparingSearch {
-                pendingSearchKeys.insert(key)
-                bufferSearchEvent(event)
-            } else if !isRepeat, index < resultCount {
-                finish(.selectAndCommit(index))
-            }
-            return consume(key)
-        }
-
-        if configurationIsValid, configuration.cycleEnabled,
-           matches(configuration.cycle, key: key, flags: flags, allowingReverse: true) {
-            if mode != .cycle, isRepeat { return consume(key) }
-            if mode == .cycle {
-                emit(.cycle(reverse: reversed))
-            } else {
+        // Explicit user bindings win in every open mode, including generic
+        // numbered selection and Contexts-style navigation/action commands.
+        if configurationIsValid, let binding = matchingCycle(key: key, flags: flags) {
+            if activeCycle != binding.kind || (mode != .cycle && mode != .cycleSearch) {
+                if isRepeat { return consume(key) }
                 mode = .cycle
-                cycleHoldModifiers = configuration.cycle.modifiers.rawValue & ~CGEventFlags.maskShift.rawValue
-                emit(.beginCycle(reverse: reversed))
+                activeCycle = binding.kind
+                cycleHoldModifiers = binding.shortcut.modifiers.rawValue
+                switch binding.kind {
+                case .primary: emit(.beginCycle(reverse: reversed))
+                case .app: emit(.beginAppCycle(reverse: reversed))
+                case .alternate: emit(.beginAlternateCycle(reverse: reversed))
+                }
+            } else {
+                emit(.cycle(reverse: reversed))
             }
             return consume(key)
         }
@@ -267,6 +276,51 @@ final class KeyboardController {
                 emit(.showSearch)
             }
             return consume(key)
+        }
+
+        if mode != .hidden, let index = directSelectionIndex(key: key, flags: flags) {
+            if mode == .search, !preparingSearch,
+               let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.hasMarkedText() {
+                return Unmanaged.passUnretained(event)
+            }
+            if mode == .search, preparingSearch {
+                pendingSearchKeys.insert(key)
+                bufferSearchEvent(event)
+            } else if !isRepeat, index < resultCount {
+                finish(.selectAndCommit(index))
+            }
+            return consume(key)
+        }
+
+        // Commands target the switcher's selected item, never the underlying app.
+        // Held-modifier search treats letters as text, including w/q/m/h.
+        if mode == .cycle || mode == .search, !preparingSearch,
+           quickSelectionModifiersAllowed(flags), let action = selectedWindowAction(key) {
+            if !isRepeat {
+                resultCount = 0
+                emit(action)
+            }
+            return consume(key)
+        }
+        if mode == .cycle, cycleCommandAllowed(flags), Int(key) == kVK_ANSI_S {
+            if !isRepeat {
+                cycleSearchExtraModifiers = flags.rawValue & Self.chordModifierMask & ~cycleHoldModifiers
+                mode = .cycleSearch
+                deadKeyState = 0
+                emit(.beginCycleSearch)
+            }
+            return consume(key)
+        }
+        if mode == .cycle, cycleCommandAllowed(flags) {
+            switch Int(key) {
+            case kVK_ANSI_P, kVK_ANSI_K:
+                emit(.move(-1))
+                return consume(key)
+            case kVK_ANSI_N, kVK_ANSI_J:
+                emit(.move(1))
+                return consume(key)
+            default: break
+            }
         }
 
         if mode == .search, preparingSearch {
@@ -300,19 +354,31 @@ final class KeyboardController {
             case kVK_Tab:
                 emit(.move(reversed ? -1 : 1))
                 return consume(key)
-            case kVK_Delete where mode == .fastSearch:
+            case kVK_Delete where mode == .fastSearch || mode == .cycleSearch:
                 deadKeyState = 0
                 resultCount = 0
                 emit(.deleteBackward)
                 return consume(key)
-            case kVK_LeftArrow where mode == .cycle:
+            case kVK_LeftArrow where mode == .cycle || mode == .cycleSearch:
                 emit(.move(-1))
                 return consume(key)
-            case kVK_RightArrow where mode == .cycle:
+            case kVK_RightArrow where mode == .cycle || mode == .cycleSearch:
                 emit(.move(1))
+                return consume(key)
+            case kVK_ANSI_Grave where mode == .cycle:
+                emit(.move(-1))
                 return consume(key)
             default: break
             }
+        }
+
+        if mode == .cycleSearch,
+           let text = translatedText(key: key, flags: flags, event: event) {
+            if !text.isEmpty {
+                resultCount = 0
+                emit(.appendText(text))
+            }
+            return consume(key)
         }
 
         if configurationIsValid, configuration.fastSearchEnabled,
@@ -334,7 +400,7 @@ final class KeyboardController {
         }
 
         // An unrelated shortcut must not leave a later modifier release armed.
-        if mode == .cycle || mode == .fastSearch {
+        if mode == .cycle || mode == .cycleSearch || mode == .fastSearch {
             finish(.cancel)
         }
         return Unmanaged.passUnretained(event)
@@ -420,6 +486,45 @@ final class KeyboardController {
         return actual & mask == shortcut.modifiers.rawValue & mask
     }
 
+    private func matchingCycle(key: CGKeyCode, flags: CGEventFlags) -> (kind: CycleKind, shortcut: KeyboardShortcut)? {
+        if configuration.cycleEnabled, matches(configuration.cycle, key: key, flags: flags, allowingReverse: true) {
+            return (.primary, configuration.cycle)
+        }
+        if configuration.appCycleEnabled, matches(configuration.appCycle, key: key, flags: flags, allowingReverse: true) {
+            return (.app, configuration.appCycle)
+        }
+        if configuration.alternateCycleEnabled, matches(configuration.alternateCycle, key: key, flags: flags, allowingReverse: true) {
+            return (.alternate, configuration.alternateCycle)
+        }
+        return nil
+    }
+
+    private func selectedWindowAction(_ key: CGKeyCode) -> KeyboardAction? {
+        switch Int(key) {
+        case kVK_ANSI_W: return .closeSelected
+        case kVK_ANSI_Q: return .quitSelectedApp
+        case kVK_ANSI_M: return .minimizeSelected
+        case kVK_ANSI_H: return .hideSelectedApp
+        default: return nil
+        }
+    }
+
+    private func cycleCommandAllowed(_ flags: CGEventFlags) -> Bool {
+        let actual = flags.rawValue & Self.chordModifierMask
+        let command = cycleHoldModifiers | CGEventFlags.maskCommand.rawValue
+        let option = cycleHoldModifiers | CGEventFlags.maskAlternate.rawValue
+        return actual == command || actual == option
+    }
+
+    private func cycleSearchFlagsAllowed(_ flags: CGEventFlags, key: CGKeyCode) -> Bool {
+        var actual = flags.rawValue & Self.chordModifierMask & ~CGEventFlags.maskShift.rawValue
+        if KeyboardShortcut.hasImplicitFunctionFlag(keyCode: key), cycleHoldModifiers & CGEventFlags.maskSecondaryFn.rawValue == 0 {
+            actual &= ~CGEventFlags.maskSecondaryFn.rawValue
+        }
+        let allowed = cycleHoldModifiers | cycleSearchExtraModifiers | CGEventFlags.maskCommand.rawValue
+        return actual & cycleHoldModifiers == cycleHoldModifiers && actual & ~allowed == 0
+    }
+
     private func directSelectionIndex(key: CGKeyCode, flags: CGEventFlags) -> Int? {
         guard quickSelectionModifiersAllowed(flags) else { return nil }
         switch Int(key) {
@@ -438,7 +543,7 @@ final class KeyboardController {
 
     private func quickSelectionModifiersAllowed(_ flags: CGEventFlags) -> Bool {
         var expected = CGEventFlags.maskCommand.rawValue
-        if mode == .cycle { expected |= cycleHoldModifiers }
+        if mode == .cycle || mode == .cycleSearch { expected |= cycleHoldModifiers }
         if mode == .fastSearch {
             let bits = fastModifierBits
             guard flags.rawValue & bits.selected != 0, flags.rawValue & bits.opposite == 0 else { return false }

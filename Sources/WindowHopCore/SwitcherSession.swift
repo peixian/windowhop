@@ -21,6 +21,7 @@ public struct SwitcherSession {
     private var warmIndex: SearchEngine.PreparedIndex?
     private var warmShortcuts = WindowSearchShortcuts.Snapshot()
     private var warmPreferences: [String: String] = [:]
+    private var warmShortcutWindows: [WindowItem] = []
     private var activeIndex: SearchEngine.PreparedIndex?
     private var activeShortcuts = WindowSearchShortcuts.Snapshot()
     private var activeWindowsByID: [String: WindowItem] = [:]
@@ -40,9 +41,10 @@ public struct SwitcherSession {
     }
 
     /// Warm new index data before keyboard invocation. A live session stays frozen.
-    public mutating func prepare(windows: [WindowItem], preferences: [String: String] = [:]) {
+    public mutating func prepare(windows: [WindowItem], preferences: [String: String] = [:], shortcutWindows: [WindowItem]? = nil) {
         warmIndex = preparationCache.prepare(windows)
-        warmShortcuts = shortcutCache.prepare(windows: windows, preferences: preferences)
+        warmShortcutWindows = shortcutWindows ?? windows
+        warmShortcuts = shortcutCache.prepare(windows: warmShortcutWindows, preferences: preferences)
         warmPreferences = preferences
     }
 
@@ -50,15 +52,21 @@ public struct SwitcherSession {
         mode: Mode,
         windows: [WindowItem],
         preferences: [String: String] = [:],
-        reverse: Bool = false
+        reverse: Bool = false,
+        shortcutWindows: [WindowItem]? = nil
     ) {
         self.mode = mode
         self.windows = windows
-        if warmIndex?.windows != windows || warmPreferences != preferences {
-            prepare(windows: windows, preferences: preferences)
+        if warmIndex?.windows != windows || warmPreferences != preferences || warmShortcutWindows != (shortcutWindows ?? windows) {
+            prepare(windows: windows, preferences: preferences, shortcutWindows: shortcutWindows)
         }
         activeIndex = warmIndex
         activeShortcuts = warmShortcuts
+        if warmShortcutWindows != windows {
+            let visibleIDs = Set(windows.map(\.id))
+            activeShortcuts.preferredByID = activeShortcuts.preferredByID.filter { visibleIDs.contains($0.key) }
+            activeShortcuts.targetByQuery = activeShortcuts.targetByQuery.filter { visibleIDs.contains($0.value) }
+        }
         searchShortcuts = activeShortcuts.preferredByID
         activeWindowsByID = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         results = windows
@@ -86,6 +94,12 @@ public struct SwitcherSession {
             results.insert(target, at: 0)
         }
         selectedIndex = 0
+    }
+
+    /// Search within the same frozen cycling snapshot and retain its code map.
+    public mutating func enterCycleSearch() {
+        guard mode == .cycle else { return }
+        mode = .fastSearch
     }
 
     public mutating func move(_ delta: Int) {

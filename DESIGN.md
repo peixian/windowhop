@@ -24,4 +24,13 @@ The first nine filtered results display compact ⌘1–⌘9 hints in the existin
 
 ## Shortcut settings
 
-Use a compact native settings window with three clearly labeled modes, a recorder for each chord, and a popup for the held Fast Search modifier. Keep controls aligned and validation inline. Save commits a draft; Cancel discards it. Recording is local to the settings window, Escape cancels recording, and global capture stays paused until the window closes. A per-binding default preset restores macOS-reserved combinations that may not reach a local recorder. Avoid translating key labels or reading preferences on the event-tap hot path.
+Use a compact native settings window with clearly labeled cycling, current-app, alternate, search, and Fast Search modes, a recorder for each chord, and a popup for the held Fast Search modifier. Keep controls aligned and validation inline. Save commits a draft; Cancel discards it. Recording is local to the settings window, Escape cancels recording, and global capture stays paused until the window closes. A per-binding default preset restores macOS-reserved combinations that may not reach a local recorder. Avoid translating key labels or reading preferences on the event-tap hot path.
+
+
+## Multiple displays and optional Sidebar
+
+Mirror one frozen switch session across every connected display by default. Each display gets its own compact panel sized to its visible frame. Only one panel owns native text editing; other panels mirror the query, row selection, and results. Clicking another panel transfers editing without cancelling. The General preference can restrict presentation to the pointer's display. Share warmed app icons, keep panel instances between invocations, and reconcile display changes without restarting the session.
+
+The optional Sidebar uses the same metadata and filters, with 24 pt rows and hidden scrollbars. Each display can list only its own windows, with Space headings where macOS provides membership. Autohide leaves a quiet edge handle. Swipe right or Hide Temporarily dismisses it until the pointer leaves and returns; Turn Off Sidebar changes the saved preference. Keep the Sidebar off by default and suppress it while the center switcher or Settings is open.
+
+Settings uses native General, Shortcuts, Window Lists, and Sidebar tabs. Main, alternate, and Sidebar lists have independent Space, hidden, and minimized filters. Present one list's settings at a time. Preserve draft values when moving between tabs. Physical trackpad edge switching is explicitly experimental and off by default.

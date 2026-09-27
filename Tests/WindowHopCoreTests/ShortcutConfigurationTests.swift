@@ -142,4 +142,48 @@ final class ShortcutConfigurationTests: XCTestCase {
         config.search = KeyboardShortcut(keyCode: 0, modifiers: .fn)
         XCTAssertNil(config.validationError())
     }
+    func testOlderSettingsKeepCustomChordsAndGainAdditionalDefaults() throws {
+        let data = Data("""
+        {"cycle":{"keyCode":38,"modifiers":1048576},"search":{"keyCode":40,"modifiers":262144},"cycleEnabled":false,"searchEnabled":true,"fastSearchEnabled":false,"fastSearchModifier":"fn"}
+        """.utf8)
+        let restored = try JSONDecoder().decode(ShortcutConfiguration.self, from: data)
+        XCTAssertEqual(restored.cycle.keyCode, 38)
+        XCTAssertEqual(restored.search.keyCode, 40)
+        XCTAssertFalse(restored.cycleEnabled)
+        XCTAssertFalse(restored.fastSearchEnabled)
+        XCTAssertEqual(restored.fastSearchModifier, .fn)
+        XCTAssertEqual(restored.appCycle, KeyboardShortcut(keyCode: 50, modifiers: .command))
+        XCTAssertTrue(restored.appCycleEnabled)
+        XCTAssertEqual(restored.alternateCycle, KeyboardShortcut(keyCode: 48, modifiers: .option))
+        XCTAssertFalse(restored.alternateCycleEnabled)
+        XCTAssertEqual(try JSONDecoder().decode(ShortcutConfiguration.self, from: JSONEncoder().encode(restored)), restored)
+    }
+
+    func testAdditionalSwitchersReserveReverseChordsAndCanBeDisabledIndependently() {
+        var config = ShortcutConfiguration.defaults
+        config.alternateCycleEnabled = true
+        XCTAssertNil(config.validationError())
+        config.appCycle = config.cycle
+        XCTAssertNotNil(config.validationError())
+        config.appCycleEnabled = false
+        XCTAssertNil(config.validationError())
+        config.search = KeyboardShortcut(keyCode: config.alternateCycle.keyCode, modifiers: config.alternateCycle.modifiers.union(.shift))
+        XCTAssertNotNil(config.validationError())
+        config.alternateCycleEnabled = false
+        XCTAssertNil(config.validationError())
+        config.appCycleEnabled = true
+        config.appCycle = KeyboardShortcut(keyCode: 50, modifiers: [.command, .shift])
+        XCTAssertNotNil(config.validationError())
+    }
+
+    func testMigratingCustomBackquoteBindingDoesNotIntroduceAConflict() throws {
+        let data = Data("""
+        {"cycle":{"keyCode":50,"modifiers":1048576},"search":{"keyCode":49,"modifiers":262144},"cycleEnabled":true,"searchEnabled":true,"fastSearchEnabled":true,"fastSearchModifier":"rightOption"}
+        """.utf8)
+        let restored = try JSONDecoder().decode(ShortcutConfiguration.self, from: data)
+        XCTAssertTrue(restored.cycleEnabled)
+        XCTAssertFalse(restored.appCycleEnabled)
+        XCTAssertNil(restored.validationError())
+    }
+
 }

@@ -32,6 +32,9 @@ No launcher dashboard, marketing copy, thumbnail grid, decorative animation, cha
 8. Let the user record cycling and search shortcuts, choose a sided Fast Search modifier, and disable each mode independently. Preserve settings across launches and reject conflicting bindings before saving.
 9. Keep numbered selection for the first nine results and show unique, stable search codes for later rows. Type a code and commit through Return or Fast Search modifier release. Learned choices override automatic assignments without changing an open session's codes.
 
+10. Show synchronized center panels on all displays by default, with a pointer-display opt-out. Independent filter profiles, current-app cycling, and optional sidebars should make the same window index useful across keyboard and mouse workflows.
+11. Window actions target the selected entry through macOS APIs. Never turn a configured cycling shortcut into a destructive action, force-quit an app, or treat a request as proof of closure.
+
 ## Accessibility & Inclusion
 
 Native controls and system fonts, semantic colors, full keyboard navigation, visible selection, and system appearance. Respect reduced motion; no transition animation is required.

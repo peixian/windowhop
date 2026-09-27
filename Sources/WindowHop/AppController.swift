@@ -5,7 +5,10 @@ import WindowHopCore
 final class AppController: NSObject, NSApplicationDelegate {
     private let index = WindowIndex()
     private let keyboard = KeyboardController()
-    private let panel = SwitcherPanel()
+    private let panel = SwitcherPanels()
+    private let sidebar = SidebarController()
+    private let gestures = TrackpadGestureController()
+    private var gestureActive = false
     private let settings = ShortcutSettingsWindow()
     private let defaults = UserDefaults.standard
     private var session = SwitcherSession()
@@ -23,6 +26,13 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var focusGeneration = UUID()
     private var shortcuts = ShortcutConfiguration.defaults
     private var settingsOpen = false
+    private var preferences = WindowHopPreferences.defaults
+    private enum SwitcherProfile { case primary, currentApplication, alternate }
+    private var activeProfile: SwitcherProfile = .primary
+    private var invocationApplication: Int32?
+    private var invocationScreen: NSScreen?
+    private var cycleSearchActive = false
+    private var demoRemovedIDs = Set<String>()
     private var cycleLabel = "⌘⇥"
     private var fastSearchLabel = "Right Option"
 
@@ -38,6 +48,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         configureMainMenu()
         configureCallbacks()
         loadShortcuts()
+        loadPreferences()
         if diagnose {
             index.start()
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
@@ -63,6 +74,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         keyboard.stop()
+        sidebar.stop()
+        gestures.enabled = false
         index.stop()
         timer?.invalidate()
     }
@@ -74,9 +87,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func configureCallbacks() {
-        settings.onSave = { [weak self] configuration in
+        settings.onSave = { [weak self] configuration, preferences in
             guard let self, configuration.validationError() == nil else { return }
             self.applyShortcuts(configuration)
+            self.applyPreferences(preferences)
             if let data = try? JSONEncoder().encode(configuration) {
                 self.defaults.set(data, forKey: "shortcutConfiguration")
             }
@@ -84,6 +98,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         settings.onClose = { [weak self] in
             guard let self else { return }
             self.settingsOpen = false
+            self.updateSidebar()
             self.statusMessage = ""
             self.updateAvailability()
         }
@@ -97,21 +112,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         index.onChange = { [weak self] windows in
             guard let self else { return }
             if !self.demo {
-                self.session.prepare(windows: windows, preferences: self.learned)
+                self.session.prepare(windows: self.filteredWindows(windows), preferences: self.learned, shortcutWindows: windows)
                 self.panel.prepare(windows: windows)
             }
             if self.pendingRefresh, self.session.mode != nil {
                 self.pendingRefresh = false
                 let mode = self.session.mode!
                 let query = self.session.query
-                self.session.begin(mode: mode, windows: windows, preferences: self.learned, reverse: self.pendingReverse)
+                self.session.begin(mode: mode, windows: self.filteredWindows(windows), preferences: self.learned, reverse: self.pendingReverse, shortcutWindows: windows)
                 if mode != .cycle || !query.isEmpty { self.session.updateQuery(query, preferences: self.learned) }
                 self.render()
             } else if self.session.mode != nil, !self.demo {
-                let live = Set(windows.map(\.id))
+                let live = Set(self.filteredWindows(windows).map(\.id))
                 for item in self.session.windows where !live.contains(item.id) { self.session.removeWindow(id: item.id) }
                 self.render()
             }
+            self.updateSidebar()
             // Do not replace a live session's order. Closed entries are checked on activation.
             self.updateMenu()
         }
@@ -128,11 +144,51 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.onSelection = { [weak self] row in
             guard let self else { return }
             self.session.move(row - self.session.selectedIndex)
+            self.render()
         }
         panel.onCommit = { [weak self] in self?.commit() }
         panel.onQuickSelect = { [weak self] index in self?.selectAndCommit(index) }
         panel.onCancel = { [weak self] in self?.cancel() }
         panel.onOpenSettings = { [weak self] in self?.requestPermission() }
+        panel.onCloseSelected = { [weak self] in self?.perform(.close) }
+        panel.onMinimizeSelected = { [weak self] in self?.perform(.minimize) }
+        panel.onHideSelectedApp = { [weak self] in self?.perform(.hideApplication) }
+        panel.onQuitSelectedApp = { [weak self] in self?.perform(.quitApplication) }
+        panel.onExcludeApplication = { [weak self] in self?.exclude($0) }
+        gestures.onBegin = { [weak self] in
+            guard let self else { return }
+            guard self.session.mode == nil, !self.settingsOpen else {
+                if self.gestureActive { self.cancel(preserveKeyboardState: true) }
+                else { self.gestures.cancel() }
+                return
+            }
+            self.gestureActive = true
+            self.begin(.cycle, fromKeyboard: true, fromGesture: true)
+        }
+        gestures.onMove = { [weak self] amount in
+            guard let self, self.gestureActive else { return }
+            self.move(amount)
+        }
+        gestures.onCommit = { [weak self] in
+            guard let self, self.gestureActive else { return }
+            self.gestureActive = false
+            self.commit(fromKeyboard: true)
+        }
+        gestures.onCancel = { [weak self] in
+            guard let self, self.gestureActive else { return }
+            self.cancel(preserveKeyboardState: true)
+        }
+        sidebar.onSelect = { [weak self] in self?.activateFromSidebar($0) }
+        sidebar.onClose = { [weak self] in self?.perform(.close, on: $0) }
+        sidebar.onMinimize = { [weak self] in self?.perform(.minimize, on: $0) }
+        sidebar.onHide = { [weak self] in self?.perform(.hideApplication, on: $0) }
+        sidebar.onQuit = { [weak self] in self?.perform(.quitApplication, on: $0) }
+        sidebar.onExclude = { [weak self] in self?.exclude($0) }
+        sidebar.onHideSidebar = { [weak self] in
+            guard let self else { return }
+            self.preferences.sidebarEnabled = false
+            self.applyPreferences(self.preferences)
+        }
     }
 
     private func configureMenu() {
@@ -206,7 +262,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if trusted && !wasTrusted { index.refresh(); statusMessage = "" }
         if !trusted && wasTrusted { keyboard.stop(); cancel() }
         wasTrusted = trusted
-        let hasBindings = shortcuts.cycleEnabled || shortcuts.searchEnabled || shortcuts.fastSearchEnabled
+        let hasBindings = shortcuts.cycleEnabled || shortcuts.appCycleEnabled || shortcuts.alternateCycleEnabled || shortcuts.searchEnabled || shortcuts.fastSearchEnabled
         if keyboard.isRunning && (settingsOpen || !hasBindings) { keyboard.stop(); cancel() }
         if keyboardEnabled, trusted, !keyboard.isRunning, !demo, !settingsOpen, hasBindings {
             if contextsRunning {
@@ -220,7 +276,17 @@ final class AppController: NSObject, NSApplicationDelegate {
             cancel()
             statusMessage = "Shortcuts paused while Contexts is running"
         }
+        updateGestureAvailability()
         updateMenu()
+    }
+
+    private func updateGestureAvailability() {
+        gestures.enabled = preferences.gestureEnabled && AXIsProcessTrusted() && !diagnose && !demo && !settingsOpen && !contextsRunning
+        if !preferences.gestureEnabled { settings.gestureStatus = "Gesture switching is off." }
+        else if !AXIsProcessTrusted() { settings.gestureStatus = "Accessibility access is required." }
+        else if contextsRunning { settings.gestureStatus = "Paused while Contexts is running." }
+        else if settingsOpen { settings.gestureStatus = "Gesture capture resumes after Settings closes." }
+        else { settings.gestureStatus = gestures.status }
     }
 
     private var contextsRunning: Bool {
@@ -233,6 +299,18 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard !settingsOpen else { return }
         switch action {
         case .beginCycle(let reverse): begin(.cycle, reverse: reverse, fromKeyboard: true)
+        case .beginAppCycle(let reverse): begin(.cycle, reverse: reverse, fromKeyboard: true, profile: .currentApplication)
+        case .beginAlternateCycle(let reverse): begin(.cycle, reverse: reverse, fromKeyboard: true, profile: .alternate)
+        case .beginCycleSearch:
+            guard session.mode == .cycle else { return }
+            cycleSearchActive = true
+            session.enterCycleSearch()
+            panel.show(mode: .fastSearch, screen: invocationScreen, demo: demo)
+            render()
+        case .closeSelected: perform(.close)
+        case .minimizeSelected: perform(.minimize)
+        case .hideSelectedApp: perform(.hideApplication)
+        case .quitSelectedApp: perform(.quitApplication)
         case .cycle(let reverse): move(reverse ? -1 : 1)
         case .showSearch: begin(.search, fromKeyboard: true)
         case .beginFastSearch(let text):
@@ -250,16 +328,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func begin(_ mode: SwitcherSession.Mode, reverse: Bool = false, fromKeyboard: Bool = false) {
+    private func begin(_ mode: SwitcherSession.Mode, reverse: Bool = false, fromKeyboard: Bool = false, profile: SwitcherProfile = .primary, fromGesture: Bool = false) {
         guard !settingsOpen else { return }
         focusGeneration = UUID()
         index.cancelPendingActivation()
+        if !fromGesture { gestures.cancel(); gestureActive = false }
+        activeProfile = profile
+        cycleSearchActive = false
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        invocationApplication = frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+            ? index.windows.first?.processIdentifier : frontmost?.processIdentifier
         if panel.isVisible { panel.hide() }
-        let windows = demo ? Self.demoWindows : (AXIsProcessTrusted() ? index.windows : [])
-        if demo { panel.prepare(windows: windows); session.prepare(windows: windows) }
+        let windows = filteredWindows(demo ? Self.demoWindows.filter { !demoRemovedIDs.contains($0.id) } : (AXIsProcessTrusted() ? index.windows : []))
+        if demo { panel.prepare(windows: windows); session.prepare(windows: windows, shortcutWindows: availableWindows) }
         pendingRefresh = windows.isEmpty && AXIsProcessTrusted() && !demo
         pendingReverse = reverse
-        session.begin(mode: mode, windows: windows, preferences: demo ? [:] : learned, reverse: reverse)
+        session.begin(mode: mode, windows: windows, preferences: demo ? [:] : learned, reverse: reverse, shortcutWindows: availableWindows)
         if !fromKeyboard {
             switch mode {
             case .cycle: keyboard.mode = .cycle
@@ -268,6 +352,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+        invocationScreen = screen
+        sidebar.suspended = true
         panel.show(mode: mode, screen: screen, demo: demo)
         render()
         if mode == .search { keyboard.searchFieldReady() }
@@ -286,13 +372,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         else if session.query.isEmpty { emptyMessage = "No windows found. Open an application window, then choose Refresh Windows." }
         else { emptyMessage = "No matching windows. Try an app name or a few letters from its title." }
         let hint: String
-        if demo { hint = "Demo windows · Type a code or title · ⌘1–9 / Return preview · Esc closes" }
+        if gestureActive { hint = "Slide to select · Lift fingers to switch · Esc cancels" }
+        else if demo { hint = "Demo windows · Type a code or title · ⌘1–9 / Return preview · Esc closes" }
         else if missingPermission { hint = "Accessibility access needed" }
         else {
             switch mode {
-            case .cycle: hint = "\(session.results.count) windows · \(cycleLabel) cycles · ⌘1–9 switches · Release modifiers to switch · Esc cancels"
+            case .cycle: hint = "\(session.results.count) windows · \(activeCycleLabel) cycles · ⌘S searches · ⌘W close · ⌘M minimize · Esc cancels"
             case .search: hint = "\(session.results.count) windows · Type a code or title · ⌘1–9 / Return switches · Esc cancels"
-            case .fastSearch: hint = "\(session.results.count) matches · Type a code or title · Release \(fastSearchLabel) to switch · Esc cancels"
+            case .fastSearch: hint = "\(session.results.count) matches · Type a code or title · Release \(cycleSearchActive ? activeCycleLabel : fastSearchLabel) to switch · Esc cancels"
             }
         }
         panel.render(session, footer: hint, emptyMessage: emptyMessage, needsPermission: missingPermission)
@@ -320,7 +407,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     if self.learned.count >= 128, let key = self.learned.keys.sorted().first { self.learned.removeValue(forKey: key) }
                     self.learned[query] = SearchEngine.preferenceKey(for: selected)
                     self.defaults.set(self.learned, forKey: "learnedSearches")
-                    self.session.prepare(windows: self.index.windows, preferences: self.learned)
+                    self.session.prepare(windows: self.filteredWindows(self.index.windows), preferences: self.learned, shortcutWindows: self.index.windows)
                 }
             case .failure(let error):
                 self.statusMessage = error.localizedDescription
@@ -343,11 +430,15 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func cancel(preserveKeyboardState: Bool = false) {
+        gestures.cancel()
+        gestureActive = false
         focusGeneration = UUID()
         index.cancelPendingActivation()
         pendingRefresh = false
         panel.hide()
         session.end()
+        cycleSearchActive = false
+        updateSidebar()
         keyboard.resultCount = 0
         if !preserveKeyboardState { keyboard.mode = .hidden }
     }
@@ -362,6 +453,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         cancel()
         keyboard.stop()
         demo = true
+        updateGestureAvailability()
+        demoRemovedIDs.removeAll()
         begin(.search)
         updateMenu()
     }
@@ -374,12 +467,94 @@ final class AppController: NSObject, NSApplicationDelegate {
         updateAvailability()
     }
     @objc private func showSettings() {
-        guard !settingsOpen else { settings.show(configuration: shortcuts); return }
+        guard !settingsOpen else { settings.show(configuration: shortcuts, preferences: preferences); return }
         cancel()
         settingsOpen = true
+        updateGestureAvailability()
+        sidebar.suspended = true
         keyboard.stop()
-        settings.show(configuration: shortcuts)
+        settings.show(configuration: shortcuts, preferences: preferences)
         updateMenu()
+    }
+
+    private var activeCycleLabel: String {
+        switch activeProfile {
+        case .primary: return cycleLabel
+        case .currentApplication: return shortcutDisplayName(shortcuts.appCycle)
+        case .alternate: return shortcutDisplayName(shortcuts.alternateCycle)
+        }
+    }
+
+    private var availableWindows: [WindowItem] { demo ? Self.demoWindows.filter { !demoRemovedIDs.contains($0.id) } : index.windows }
+
+    private func filteredWindows(_ windows: [WindowItem]) -> [WindowItem] {
+        let ignored = Set(preferences.ignoredBundleIdentifiers)
+        var policy = activeProfile == .alternate ? preferences.alternateList : preferences.primaryList
+        policy.currentApplicationOnly = activeProfile == .currentApplication
+        return policy.apply(to: windows.filter { !ignored.contains($0.bundleIdentifier) },
+                            frontmostProcessIdentifier: invocationApplication)
+    }
+
+    private func loadPreferences() {
+        if let data = defaults.data(forKey: "windowPreferences"),
+           let saved = try? JSONDecoder().decode(WindowHopPreferences.self, from: data) { preferences = saved }
+        applyPreferences(preferences)
+    }
+
+    private func applyPreferences(_ preferences: WindowHopPreferences) {
+        self.preferences = preferences
+        panel.showsOnAllDisplays = preferences.showsOnAllDisplays
+        panel.showsBadges = preferences.showsBadges
+        if let data = try? JSONEncoder().encode(preferences) { defaults.set(data, forKey: "windowPreferences") }
+        session.prepare(windows: filteredWindows(index.windows), preferences: learned, shortcutWindows: index.windows)
+        updateGestureAvailability()
+        updateSidebar()
+    }
+
+    private func updateSidebar() {
+        sidebar.suspended = diagnose || settingsOpen || session.mode != nil || (!demo && !AXIsProcessTrusted())
+        sidebar.update(windows: availableWindows, preferences: preferences)
+    }
+
+    private func exclude(_ item: WindowItem) {
+        guard !item.bundleIdentifier.isEmpty else { return }
+        if !preferences.ignoredBundleIdentifiers.contains(item.bundleIdentifier) {
+            preferences.ignoredBundleIdentifiers.append(item.bundleIdentifier)
+        }
+        for candidate in session.windows where candidate.bundleIdentifier == item.bundleIdentifier { session.removeWindow(id: candidate.id) }
+        applyPreferences(preferences)
+        render()
+    }
+
+    private func perform(_ action: WindowIndex.WindowAction, on item: WindowItem? = nil) {
+        guard let selected = item ?? session.selected else { return }
+        if demo {
+            let affected = (action == .hideApplication || action == .quitApplication)
+                ? availableWindows.filter { $0.bundleIdentifier == selected.bundleIdentifier } : [selected]
+            for window in affected { demoRemovedIDs.insert(window.id); session.removeWindow(id: window.id) }
+            updateSidebar()
+            render()
+            return
+        }
+        let generation = focusGeneration
+        index.perform(action, on: selected) { [weak self] result in
+            guard let self, self.focusGeneration == generation else { return }
+            if case .failure(let error) = result { self.statusMessage = error.localizedDescription; NSSound.beep() }
+            else { self.statusMessage = "" }
+            self.updateMenu()
+        }
+    }
+
+    private func activateFromSidebar(_ item: WindowItem) {
+        if demo { statusMessage = "Demo selected: \(item.appName)"; updateMenu(); return }
+        cancel()
+        let generation = focusGeneration
+        index.activate(item) { [weak self] result in
+            guard let self, self.focusGeneration == generation else { return }
+            if case .failure(let error) = result { self.statusMessage = error.localizedDescription; NSSound.beep() }
+            else { self.statusMessage = "" }
+            self.updateMenu()
+        }
     }
 
     private func loadShortcuts() {
@@ -398,6 +573,15 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func applyShortcuts(_ configuration: ShortcutConfiguration) {
         shortcuts = configuration
         keyboard.configuration = configuration
+        let bindings: [(Bool, KeyboardShortcut)] = [
+            (configuration.cycleEnabled, configuration.cycle),
+            (configuration.appCycleEnabled, configuration.appCycle),
+            (configuration.alternateCycleEnabled, configuration.alternateCycle),
+            (configuration.searchEnabled, configuration.search)
+        ]
+        panel.reservedCommandKeyCodes = Set(bindings.compactMap { enabled, shortcut in
+            enabled && shortcut.modifiers == .command ? shortcut.keyCode : nil
+        })
         // Translate key labels only when settings change, never during selection.
         cycleLabel = shortcutDisplayName(configuration.cycle)
         fastSearchLabel = configuration.fastSearchModifier.displayName
@@ -405,7 +589,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc private func forgetSearches() {
         learned = [:]
         defaults.removeObject(forKey: "learnedSearches")
-        session.prepare(windows: demo ? Self.demoWindows : index.windows)
+        session.prepare(windows: filteredWindows(availableWindows), shortcutWindows: availableWindows)
     }
     @objc private func requestPermission() {
         cancel()

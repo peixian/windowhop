@@ -13,6 +13,7 @@ final class WindowIndex {
     private struct Record {
         let id: String
         let pid: pid_t
+        let application: NSRunningApplication
         let element: AXUIElement
         let windowID: CGWindowID?
         let item: WindowItem
@@ -25,12 +26,15 @@ final class WindowIndex {
     private struct FocusTarget {
         let id: String
         let pid: pid_t
+        let application: NSRunningApplication
         let element: AXUIElement
         let windowID: CGWindowID?
         let generation: UUID
+        let isApplicationOnly: Bool
 
         func replacingElement(_ element: AXUIElement) -> FocusTarget {
-            FocusTarget(id: id, pid: pid, element: element, windowID: windowID, generation: generation)
+            FocusTarget(id: id, pid: pid, application: application, element: element, windowID: windowID,
+                        generation: generation, isApplicationOnly: isApplicationOnly)
         }
     }
 
@@ -48,6 +52,21 @@ final class WindowIndex {
             case .permission: return "WindowHop needs Accessibility access to switch windows."
             case .notFocused: return "macOS did not focus the selected window. Try again; a dialog or another Space may be blocking it."
             case .superseded: return "The window switch was cancelled by a newer request."
+            }
+        }
+    }
+
+    enum WindowAction { case close, minimize, hideApplication, quitApplication }
+
+    enum ActionError: LocalizedError {
+        case unavailable, permission, unsupported, failed, superseded
+        var errorDescription: String? {
+            switch self {
+            case .unavailable: return "That window or application is no longer available."
+            case .permission: return "WindowHop needs Accessibility access to manage windows."
+            case .unsupported: return "This application does not support that window action."
+            case .failed: return "The application did not accept that action."
+            case .superseded: return "The action was cancelled by a newer request."
             }
         }
     }
@@ -76,6 +95,8 @@ final class WindowIndex {
     private var lastStatus = ""
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private let axTimeout: Float = 0.12
+    private var environment = WindowEnvironment()
+    private var dockBadges: [String: String] = [:]
 
     func start() {
         dispatchPrecondition(condition: .onQueue(.main))
@@ -170,6 +191,9 @@ final class WindowIndex {
             return
         }
         scanning = true
+        // Snapshot once per scan, never on invocation or the keyboard path.
+        environment = WindowEnvironment.capture()
+        dockBadges = DockBadgeReader.read(timeout: axTimeout)
         let apps = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated
         }
@@ -205,12 +229,19 @@ final class WindowIndex {
         ensureObserver(pid: pid, application: application)
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value)
-        guard result == .success, let elements = value as? [AXUIElement] else { return }
+        guard result == .success, let elements = value as? [AXUIElement] else {
+            // An AX-uncooperative app is still a valid application target. Keep
+            // last-known real windows after transient IPC errors.
+            if !records.values.contains(where: { $0.pid == pid && !$0.item.isApplicationOnly }) {
+                recordApplicationOnly(app, element: application)
+            }
+            return
+        }
         let name = app.localizedName ?? "Application"
         // Enumeration succeeded, so references absent from this list can be
         // discarded even when attribute reads are split across reconciliations.
         let removed = records.values.filter { record in
-            record.pid == pid && !elements.contains(where: { CFEqual($0, record.element) })
+            record.pid == pid && !record.item.isApplicationOnly && !elements.contains(where: { CFEqual($0, record.element) })
         }.map(\.id)
         for id in removed { records.removeValue(forKey: id); removeWindowObservation(id: id, pid: pid) }
         let offset = min(scanOffsets[pid] ?? 0, max(0, elements.count - 1))
@@ -226,10 +257,12 @@ final class WindowIndex {
             let element = elements[position]
             AXUIElementSetMessagingTimeout(element, axTimeout)
             let (id, windowID) = identity(element, pid: pid)
-            let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXMinimizedAttribute] as CFArray
+            // AXFullScreen is an optional, undocumented AX attribute. Unsupported
+            // values are ignored; Space metadata provides a separate fallback.
+            let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXMinimizedAttribute, "AXFullScreen"] as CFArray
             var values: CFArray?
             guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
-                  let attributes = values as? [Any], attributes.count == 4 else { continue }
+                  let attributes = values as? [Any], attributes.count == 5 else { continue }
             guard let role = attributes[0] as? String else { continue }
             guard role == kAXWindowRole else {
                 records.removeValue(forKey: id)
@@ -244,15 +277,44 @@ final class WindowIndex {
             }
             let title = attributes[2] as? String ?? ""
             let minimized = (attributes[3] as? NSNumber)?.boolValue ?? false
+            let metadata = environment.metadata(windowID: windowID, minimized: minimized, hidden: app.isHidden)
+            let fullScreen = (attributes[4] as? NSNumber)?.boolValue == true || metadata.isFullScreen
             let previous = records[id]
             if previous == nil { ordinal &+= 1 }
             let item = WindowItem(id: id, appName: name, title: title,
                                   bundleIdentifier: app.bundleIdentifier ?? "",
-                                  isMinimized: minimized, isHidden: app.isHidden)
-            records[id] = Record(id: id, pid: pid, element: element, windowID: windowID, item: item,
+                                  isMinimized: minimized, isHidden: app.isHidden,
+                                  processIdentifier: pid, isOnVisibleSpace: metadata.isOnVisibleSpace,
+                                  isFullScreen: fullScreen, displayID: metadata.displayID,
+                                  spaceIDs: metadata.spaceIDs, spaceTitle: metadata.spaceTitle,
+                                  badge: badge(for: app))
+            records[id] = Record(id: id, pid: pid, application: app, element: element, windowID: windowID, item: item,
                                  ordinal: previous?.ordinal ?? ordinal, recency: previous?.recency ?? 0)
             observeWindow(id: id, pid: pid, element: element)
         }
+        let applicationID = "\(pid):application"
+        if records.values.contains(where: { $0.pid == pid && !$0.item.isApplicationOnly }) {
+            records.removeValue(forKey: applicationID)
+        } else {
+            recordApplicationOnly(app, element: application)
+        }
+    }
+
+    private func badge(for app: NSRunningApplication) -> String? {
+        guard let path = app.bundleURL?.standardizedFileURL.path else { return nil }
+        return dockBadges[path]
+    }
+
+    private func recordApplicationOnly(_ app: NSRunningApplication, element: AXUIElement) {
+        let pid = app.processIdentifier
+        let id = "\(pid):application"
+        let previous = records[id]
+        if previous == nil { ordinal &+= 1 }
+        let item = WindowItem(id: id, appName: app.localizedName ?? "Application", title: "No open windows",
+                              bundleIdentifier: app.bundleIdentifier ?? "", isHidden: app.isHidden,
+                              processIdentifier: pid, isApplicationOnly: true, badge: badge(for: app))
+        records[id] = Record(id: id, pid: pid, application: app, element: element, windowID: nil, item: item,
+                             ordinal: previous?.ordinal ?? ordinal, recency: previous?.recency ?? 0)
     }
 
     private func identity(_ element: AXUIElement, pid: pid_t) -> (String, CGWindowID?) {
@@ -287,7 +349,8 @@ final class WindowIndex {
         if entry.windows[id] != nil { removeWindowObservation(id: id, pid: pid); entry = observers[pid]! }
         let context = Unmanaged.passUnretained(self).toOpaque()
         for name in [kAXTitleChangedNotification, kAXUIElementDestroyedNotification,
-                     kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification] {
+                     kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
+                     kAXMovedNotification, kAXResizedNotification] {
             AXObserverAddNotification(entry.observer, element, name as CFString, context)
         }
         entry.windows[id] = element
@@ -297,7 +360,8 @@ final class WindowIndex {
     private func removeWindowObservation(id: String, pid: pid_t) {
         guard var entry = observers[pid], let element = entry.windows.removeValue(forKey: id) else { return }
         for name in [kAXTitleChangedNotification, kAXUIElementDestroyedNotification,
-                     kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification] {
+                     kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
+                     kAXMovedNotification, kAXResizedNotification] {
             AXObserverRemoveNotification(entry.observer, element, name as CFString)
         }
         observers[pid] = entry
@@ -328,8 +392,8 @@ final class WindowIndex {
         guard pid != ownPID, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, axTimeout)
-        guard let element = focusedWindow(in: app),
-              let record = matchingRecord(element, pid: pid), record.id != focusedID else { return }
+        let record = focusedWindow(in: app).flatMap { matchingRecord($0, pid: pid) } ?? records["\(pid):application"]
+        guard let record, record.id != focusedID else { return }
         focusedID = record.id
         recency &+= 1
         records[record.id]?.recency = recency
@@ -356,7 +420,8 @@ final class WindowIndex {
         }.map(\.item)
         let token = generation
         let targets = records.mapValues {
-            FocusTarget(id: $0.id, pid: $0.pid, element: $0.element, windowID: $0.windowID, generation: token)
+            FocusTarget(id: $0.id, pid: $0.pid, application: $0.application, element: $0.element, windowID: $0.windowID,
+                        generation: token, isApplicationOnly: $0.item.isApplicationOnly)
         }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mainGeneration == token else { return }
@@ -441,11 +506,105 @@ final class WindowIndex {
         }
     }
 
+    /// Success means the request was accepted. Close/quit may present an unsaved
+    /// document dialog; observers, not the caller, decide when a target is gone.
+    /// Destructive requests are never retried or escalated to force-quit.
+    func perform(_ action: WindowAction, on item: WindowItem,
+                 completion: @escaping (Result<Void, Error>) -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let request = UUID()
+        activationLock.lock()
+        activationRequest = request
+        activationLock.unlock()
+        guard let target = focusRecords[item.id], !target.application.isTerminated,
+              target.application.processIdentifier == target.pid else {
+            finishFocus(request, result: .failure(ActionError.unavailable), completion: completion)
+            return
+        }
+        let app = target.application
+        if action == .hideApplication || action == .quitApplication {
+            guard isCurrentActivation(request) else { return }
+            let accepted = action == .hideApplication ? app.hide() : app.terminate()
+            refresh()
+            finishFocus(request, result: accepted ? .success(()) : .failure(ActionError.failed), completion: completion)
+            return
+        }
+        guard !target.isApplicationOnly else {
+            finishFocus(request, result: .failure(ActionError.unsupported), completion: completion)
+            return
+        }
+        focusWorker.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(.failure(ActionError.unavailable)) }
+                return
+            }
+            guard self.continueFocus(request, completion: completion) else { return }
+            guard AXIsProcessTrusted() else {
+                self.clearFocusSnapshotAfterPermissionLoss(generation: target.generation)
+                self.finishFocus(request, result: .failure(ActionError.permission), completion: completion)
+                return
+            }
+            AXUIElementSetMessagingTimeout(target.element, self.axTimeout)
+            let result: AXError
+            if action == .minimize {
+                guard self.continueFocus(request, completion: completion) else { return }
+                result = AXUIElementSetAttributeValue(target.element, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+            } else {
+                var value: CFTypeRef?
+                let lookup = AXUIElementCopyAttributeValue(target.element, kAXCloseButtonAttribute as CFString, &value)
+                guard self.continueFocus(request, completion: completion) else { return }
+                guard lookup == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+                    self.finishFocus(request, result: .failure(self.actionError(for: lookup)), completion: completion)
+                    return
+                }
+                let button = unsafeBitCast(value, to: AXUIElement.self)
+                AXUIElementSetMessagingTimeout(button, self.axTimeout)
+                guard self.continueFocus(request, completion: completion) else { return }
+                result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            }
+            self.refresh()
+            self.finishFocus(request, result: result == .success ? .success(()) : .failure(self.actionError(for: result)),
+                             completion: completion)
+        }
+    }
+
+    private func actionError(for result: AXError) -> ActionError {
+        switch result {
+        case .apiDisabled: return .permission
+        case .invalidUIElement: return .unavailable
+        case .success, .noValue, .attributeUnsupported, .actionUnsupported, .notImplemented: return .unsupported
+        default: return .failed
+        }
+    }
+
+    private func activateApplication(_ app: NSRunningApplication, record: FocusTarget, request: UUID,
+                                     completion: @escaping (Result<Void, Error>) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { completion(.failure(FocusError.unavailable)); return }
+            guard self.isCurrentActivation(request) else { completion(.failure(FocusError.superseded)); return }
+            guard !app.isTerminated else { completion(.failure(FocusError.unavailable)); return }
+            app.unhide()
+            guard self.isCurrentActivation(request) else { completion(.failure(FocusError.superseded)); return }
+            let accepted = app.activate(options: [.activateIgnoringOtherApps])
+            self.focusWorker.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self, self.continueFocus(request, completion: completion) else { return }
+                let active = accepted && NSWorkspace.shared.frontmostApplication?.processIdentifier == record.pid
+                self.reconcileAfterFocus(pid: record.pid, generation: record.generation)
+                self.finishFocus(request, result: active ? .success(()) : .failure(FocusError.notFocused), completion: completion)
+            }
+        }
+    }
+
     private func focus(_ record: FocusTarget, request: UUID, attempt: Int,
                        completion: @escaping (Result<Void, Error>) -> Void) {
         guard continueFocus(request, completion: completion) else { return }
-        guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated else {
+        let app = record.application
+        guard !app.isTerminated, app.processIdentifier == record.pid else {
             finishFocus(request, result: .failure(FocusError.unavailable), completion: completion)
+            return
+        }
+        if record.isApplicationOnly {
+            activateApplication(app, record: record, request: request, completion: completion)
             return
         }
         AXUIElementSetMessagingTimeout(record.element, axTimeout)
@@ -608,7 +767,7 @@ final class WindowIndex {
     }
 }
 
-/// The only private API in the index. This maps an already-accessible element to
+/// This private API maps an already-accessible element to
 /// an identity; it cannot enumerate missing windows or change focus. If unavailable,
 /// the index retains identities by CFEqual comparison of Accessibility references.
 private enum WindowIDBridge {
@@ -621,5 +780,173 @@ private enum WindowIDBridge {
         guard let function else { return nil }
         var number: CGWindowID = 0
         return function(element, &number) == .success && number != 0 ? number : nil
+    }
+}
+
+/// Read-only metadata gathered away from the main thread. Core Graphics uses a
+/// top-left global origin for both window and display rectangles.
+private struct WindowEnvironment {
+    struct Metadata {
+        var isOnVisibleSpace: Bool?
+        var isFullScreen = false
+        var displayID: UInt32?
+        var spaceIDs: [UInt64] = []
+        var spaceTitle: String?
+    }
+    private struct WindowInfo { let onscreen: Bool; let bounds: CGRect? }
+    private var info: [CGWindowID: WindowInfo] = [:]
+    private var displays: [(id: CGDirectDisplayID, bounds: CGRect)] = []
+    private var spaces = SpaceMetadataBridge.Snapshot()
+
+    static func capture() -> WindowEnvironment {
+        var snapshot = WindowEnvironment()
+        if let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for window in list {
+                guard let id = (window[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
+                let bounds = (window[kCGWindowBounds as String] as? [String: Any]).flatMap {
+                    CGRect(dictionaryRepresentation: $0 as CFDictionary)
+                }
+                snapshot.info[id] = WindowInfo(onscreen: (window[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false,
+                                               bounds: bounds)
+            }
+        }
+        var count: UInt32 = 0
+        if CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 {
+            var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+            if CGGetActiveDisplayList(count, &ids, &count) == .success {
+                snapshot.displays = ids.prefix(Int(count)).map { ($0, CGDisplayBounds($0)) }
+            }
+        }
+        snapshot.spaces = SpaceMetadataBridge.snapshot()
+        return snapshot
+    }
+
+    func metadata(windowID: CGWindowID?, minimized: Bool, hidden: Bool) -> Metadata {
+        guard let windowID else { return Metadata() }
+        var result = Metadata()
+        result.spaceIDs = SpaceMetadataBridge.spaceIDs(for: windowID)
+        if !result.spaceIDs.isEmpty, !spaces.visible.isEmpty {
+            result.isOnVisibleSpace = result.spaceIDs.contains(where: spaces.visible.contains)
+            result.isFullScreen = result.spaceIDs.contains(where: spaces.fullScreen.contains)
+            result.spaceTitle = result.spaceIDs.count > 1 ? "Multiple Spaces" : spaces.titles[result.spaceIDs[0]]
+            // A sticky window can belong to multiple Spaces. Prefer a currently
+            // visible Space's display before falling back to its first membership.
+            let firstSpace = result.spaceIDs.first(where: spaces.visible.contains) ?? result.spaceIDs[0]
+            result.displayID = spaces.displays[firstSpace]
+        }
+        if let window = info[windowID] {
+            if result.isOnVisibleSpace == nil {
+                // Offscreen is not equivalent to another Space for these states.
+                result.isOnVisibleSpace = window.onscreen ? true : (minimized || hidden ? nil : false)
+            }
+            if let bounds = window.bounds {
+                let intersections = displays.map { display in
+                    let intersection = bounds.intersection(display.bounds)
+                    return (display.id, intersection.isNull ? CGFloat(0) : intersection.width * intersection.height)
+                }
+                if let best = intersections.max(by: { $0.1 < $1.1 }), best.1 > 0 {
+                    result.displayID = best.0
+                }
+            }
+        }
+        return result
+    }
+}
+
+/// Optional, dynamically resolved SkyLight *read-only* calls. They do not move
+/// windows, change Spaces, inject into Dock, or require weakening SIP. If symbols
+/// or dictionaries change, Core Graphics on-screen metadata remains the fallback.
+private enum SpaceMetadataBridge {
+    struct Snapshot {
+        var visible: Set<UInt64> = []
+        var fullScreen: Set<UInt64> = []
+        var displays: [UInt64: UInt32] = [:]
+        var titles: [UInt64: String] = [:]
+    }
+    private typealias Connection = @convention(c) () -> Int32
+    private typealias CopyDisplaySpaces = @convention(c) (Int32) -> Unmanaged<CFArray>?
+    private typealias CopyWindowSpaces = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?
+    private static func symbol<T>(_ names: [String], as: T.Type) -> T? {
+        for name in names {
+            if let pointer = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) { return unsafeBitCast(pointer, to: T.self) }
+        }
+        return nil
+    }
+    private static let connection = symbol(["SLSMainConnectionID", "CGSMainConnectionID"], as: Connection.self)
+    private static let copyDisplaySpaces = symbol(["SLSCopyManagedDisplaySpaces", "CGSCopyManagedDisplaySpaces"], as: CopyDisplaySpaces.self)
+    private static let copyWindowSpaces = symbol(["SLSCopySpacesForWindows", "CGSCopySpacesForWindows"], as: CopyWindowSpaces.self)
+
+    static func snapshot() -> Snapshot {
+        guard let connection, let copyDisplaySpaces,
+              let array = copyDisplaySpaces(connection())?.takeRetainedValue() as? [[String: Any]] else { return Snapshot() }
+        var result = Snapshot()
+        var desktopNumber = 0
+        var fullScreenNumber = 0
+        for display in array {
+            var displayID: UInt32?
+            if let identifier = display["Display Identifier"] as? String,
+               let uuid = CFUUIDCreateFromString(nil, identifier as CFString) {
+                let id = CGDisplayGetDisplayIDFromUUID(uuid)
+                if id != 0 { displayID = id }
+            }
+            if let current = display["Current Space"] as? [String: Any], let id = id(of: current) { result.visible.insert(id) }
+            for space in display["Spaces"] as? [[String: Any]] ?? [] {
+                guard let id = id(of: space) else { continue }
+                let fullScreen = (space["type"] as? NSNumber)?.intValue == 4
+                if fullScreen {
+                    fullScreenNumber += 1
+                    result.fullScreen.insert(id)
+                    result.titles[id] = "Full Screen \(fullScreenNumber)"
+                } else {
+                    desktopNumber += 1
+                    result.titles[id] = "Desktop \(desktopNumber)"
+                }
+                result.displays[id] = displayID
+            }
+        }
+        return result
+    }
+
+    private static func id(of dictionary: [String: Any]) -> UInt64? {
+        let value = (dictionary["id64"] as? NSNumber)?.uint64Value ?? (dictionary["ManagedSpaceID"] as? NSNumber)?.uint64Value
+        return value == 0 ? nil : value
+    }
+
+    static func spaceIDs(for window: CGWindowID) -> [UInt64] {
+        guard let connection, let copyWindowSpaces,
+              let result = copyWindowSpaces(connection(), 0x7, [NSNumber(value: window)] as CFArray)?.takeRetainedValue() as? [NSNumber] else { return [] }
+        return Array(Set(result.map(\.uint64Value).filter { $0 != 0 })).sorted()
+    }
+}
+
+/// Dock exposes the badge itself as AXStatusLabel. Match its AXURL to the app's
+/// bundle URL; never guess counts from a localized description or display name.
+/// This optional attribute is undocumented, so absent/unsupported means no badge.
+private enum DockBadgeReader {
+    static func read(timeout: Float) -> [String: String] {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return [:] }
+        let application = AXUIElementCreateApplication(dock.processIdentifier)
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.25
+        var pending = [(application, 0)]
+        var cursor = 0
+        var badges: [String: String] = [:]
+        while cursor < pending.count, cursor < 128, ProcessInfo.processInfo.systemUptime < deadline {
+            let (element, depth) = pending[cursor]
+            cursor += 1
+            AXUIElementSetMessagingTimeout(element, timeout)
+            let names = [kAXURLAttribute, "AXStatusLabel", kAXChildrenAttribute] as CFArray
+            var values: CFArray?
+            guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
+                  let attributes = values as? [Any], attributes.count == 3 else { continue }
+            let url = (attributes[0] as? URL) ?? (attributes[0] as? String).flatMap(URL.init(string:))
+            if let url, url.isFileURL, url.pathExtension.lowercased() == "app",
+               let badge = attributes[1] as? String, !badge.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                badges[url.standardizedFileURL.path] = badge
+            }
+            if depth < 2, let children = attributes[2] as? [AXUIElement] {
+                pending.append(contentsOf: children.prefix(128 - min(128, pending.count)).map { ($0, depth + 1) })
+            }
+        }
+        return badges
     }
 }
