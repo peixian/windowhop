@@ -29,11 +29,11 @@ Two real, nonmirrored displays were connected: Studio Display (logical 2560×144
 
 ### Permission and live-action boundary
 
-An earlier build, before these changes, successfully indexed 24 real windows, searched native app/title queries, focused Finder Recents, and observed it become first in per-window recency. **The new rebuilt app reports missing Accessibility access.** The earlier result does not establish working focus or discovery in this binary. Ad-hoc signatures can require restarting or re-adding the rebuilt app in Accessibility settings.
+The intermediate rebuilt app reported missing Accessibility access, so the settings and action checks above used demo data. **The final release launch recognized Accessibility access:** it displayed 23 real window/application entries, including hidden and windowless apps and nonempty Dock badges. Typing `finder downloads` narrowed the list to the real Finder Downloads window; after Return, Finder's active window was Downloads. This establishes discovery, native search, and one normal focus path in the final binary. Ad-hoc signatures can still require restarting or re-adding future rebuilds in Accessibility settings.
 
 Physical global Command-Tab and held-modifier Fast Search remain unverified: Contexts was left running, and WindowHop pauses capture while it is present. Synthetic harnesses do not count as live event-tap validation.
 
-Still requiring a permitted, nonconflicting live session: real close/minimize/hide/quit and unsaved-document dialogs; hidden/minimized activation; physical gesture devices; display hotplug and click focus transfer; full-screen/Space transitions and Dock badges; arbitrary keyboard layouts/IME composition; sleep/wake and permission revocation. No claim of complete historical Contexts parity follows from the implemented feature checklist.
+Still requiring a permitted, nonconflicting live session: real close/minimize/hide/quit and unsaved-document dialogs; hidden/minimized activation; physical gesture devices; display hotplug and click focus transfer; full-screen/Space transitions and badge updates; arbitrary keyboard layouts/IME composition; sleep/wake and permission revocation. No claim of complete historical Contexts parity follows from the implemented feature checklist.
 
 ## Performance
 
