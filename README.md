@@ -66,7 +66,7 @@ An experimental two-finger trackpad-corner gesture is available in General, off 
 
 Spaces, full-screen discovery, and Dock badges depend on information macOS exposes and remain best effort. Actions request graceful closure or quit, allowing the target app to show save dialogs. Browser-tab search is [researched](docs/BROWSER-TABS.md) but not implemented. See [Contexts feature coverage and platform boundaries](docs/CONTEXTS-PARITY.md).
 
-**Rebuilding can reset Accessibility access** with the default ad-hoc signature. If shortcuts or window discovery stop working after a build, re-enable WindowHop in Accessibility settings. Secure Keyboard Entry can also prevent global shortcut capture.
+**Rebuilding can reset Accessibility access** with the default ad-hoc signature. Use a [persistent signing identity](docs/SIGNING.md) to keep the app's identity stable across builds. Switching identities may require one final approval. Secure Keyboard Entry can also prevent global shortcut capture.
 
 Everything runs locally. No network service, analytics, or Screen Recording permission is needed. Learned searches are stored in macOS preferences; window titles and queries are not logged.
 
@@ -80,7 +80,7 @@ swift test
 ./scripts/benchmark-search.sh
 ```
 
-Builds use release optimization by default. Set `CONFIGURATION=debug` for a debug build, or `SIGN_IDENTITY` to use an existing signing identity. If your environment blocks SwiftPM's nested sandbox, use `SWIFTPM_DISABLE_SANDBOX=1 ./scripts/build.sh` and `swift test --disable-sandbox`.
+Builds use release optimization by default. Set `CONFIGURATION=debug` for a debug build. Signing uses `SIGN_IDENTITY`, then the local `.signing-identity` file, then ad-hoc signing if neither is configured. A configured identity that cannot sign fails the build and preserves the previous app. If your environment blocks SwiftPM's nested sandbox, use `SWIFTPM_DISABLE_SANDBOX=1 ./scripts/build.sh` and `swift test --disable-sandbox`.
 
 - [Validation and performance](docs/VALIDATION.md) — tested behavior, benchmarks, and remaining checks. Core timings do not measure end-to-end switching latency.
 - [API research](docs/API-RESEARCH.md) — Accessibility APIs, alternatives, and the isolated private window-ID helper.
